@@ -1,0 +1,26 @@
+{
+  "dataset": "openai/gsm8k",
+  "name": "main",
+  "revision": "740312add88f781978c0658806c59bc2815b9866",
+  "seed": 42,
+  "profiles": {
+    "smoke": {
+      "sft": 8,
+      "grpo": 8,
+      "validation": 4,
+      "test": 4
+    },
+    "pilot": {
+      "sft": 64,
+      "grpo": 64,
+      "validation": 32,
+      "test": 32
+    },
+    "full": {
+      "sft": 512,
+      "grpo": 512,
+      "validation": 128,
+      "test": 200
+    }
+  }
+}

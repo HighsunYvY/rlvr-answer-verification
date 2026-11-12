@@ -1,0 +1,36 @@
+# Python environments, caches, and build artifacts
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# Local environment files and OS metadata
+.env
+.env.*
+!.env.example
+.DS_Store
+
+# Experiment inputs, caches, and checkpoints
+.cache/
+data/
+models/
+checkpoints/
+*.safetensors
+*.bin
+*.pt
+*.pth
+
+# Experiment and test outputs
+/outputs/*
+!/outputs/.gitkeep
+logs/
+*.log
+*.log.*
+
+# Local scripts and project guidance
+/scripts/
+/guiding/

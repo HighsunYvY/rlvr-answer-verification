@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "num_generations": 4,
+  "seed": 42,
+  "min_false_positives": 1,
+  "min_variable_total_reward_groups": 2,
+  "min_variable_total_reward_fraction": 0.1,
+  "purpose": "Preregistered operational admission on E1 validation generations; manual review required"
+}

@@ -1,0 +1,2 @@
+# Build backend for --no-build-isolation editable installs; matches pyproject.toml.
+setuptools==80.9.0
