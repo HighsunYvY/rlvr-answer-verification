@@ -1,4 +1,4 @@
-"""Shared E0-E3 evaluation and preregistered E1 sampled weak-verifier audit."""
+"""Shared evaluation, sampled validation, and preregistered E1 weak-verifier audit."""
 import json
 from pathlib import Path
 import statistics
@@ -18,20 +18,24 @@ def group_signal(rows):
 
 
 def run_rollouts(preparation_dir, model_dir, output_dir, profile='smoke', mode='smoke',
-                 checkpoint_dir=None, sft_dir=None, split='test', approval=None, weak_audit=False):
+                 checkpoint_dir=None, sft_dir=None, split='test', approval=None, weak_audit=False,
+                 sampled_validation=False):
     policy = checkpoint(checkpoint_dir) if checkpoint_dir else None
     stage = 'weak_audit' if weak_audit else (policy['stage'] if policy else 'E0') + '_eval'
     criteria = read_json(ROOT / 'configs/weak_audit.json') if weak_audit else None
     if weak_audit and (not policy or policy['stage'] != 'E1' or split != 'validation'):
         raise ValueError('weak audit requires E1 and validation only')
+    if sampled_validation and (not policy or policy['stage'] not in ('E1', 'E2', 'E3') or split != 'validation'):
+        raise ValueError('sampled evaluation requires an E1/E2/E3 checkpoint and the validation split')
+    grouped = weak_audit or sampled_validation
     decode = read_json(ROOT / 'configs/evaluation.yaml')['generation'].copy()
     prompt_limit = None
-    if weak_audit:
+    if grouped:
         source = read_json(ROOT / 'configs/grpo_weak.yaml')
         opts = {**source['trainer'], **source['profiles'][profile]}
         prompt_limit = opts['max_prompt_length']
         decode = {'do_sample': True, 'max_new_tokens': opts['max_completion_length'],
-                  'num_return_sequences': criteria['num_generations'],
+                  'num_return_sequences': criteria['num_generations'] if criteria else opts['num_generations'],
                   'temperature': opts['temperature'], 'top_p': opts['top_p'], 'top_k': None}
     settings = {'generation': decode, 'split': split, 'seed': 42, 'prompt_limit': prompt_limit,
                 'criteria': criteria, 'validation_groups':
@@ -43,7 +47,7 @@ def run_rollouts(preparation_dir, model_dir, output_dir, profile='smoke', mode='
         tokenizer, torch = current.tokenizer, current.torch
         from transformers import GenerationConfig
         eos = model.generation_config.eos_token_id
-        eos_ids = [tokenizer.eos_token_id] if weak_audit else ([eos] if isinstance(eos, int) else eos)
+        eos_ids = [tokenizer.eos_token_id] if grouped else ([eos] if isinstance(eos, int) else eos)
         if not eos_ids or tokenizer.eos_token_id not in eos_ids:
             raise ValueError('model/tokenizer EOS mismatch')
         generation = GenerationConfig(**decode, num_beams=1, eos_token_id=eos_ids,
@@ -72,7 +76,7 @@ def run_rollouts(preparation_dir, model_dir, output_dir, profile='smoke', mode='
                 members = []
                 for member, sequence in enumerate(sequences):
                     ids = sequence[width:].tolist()
-                    identifier = frozen['sample_id'] if not weak_audit else f"{frozen['sample_id']}#g{member}"
+                    identifier = f"{frozen['sample_id']}#g{member}" if grouped else frozen['sample_id']
                     raw.write(json.dumps({'sample_id': identifier, 'source_sample_id': frozen['sample_id'],
                                           'prompt_tokens': width, 'generated_token_ids': ids}) + '\n')
                     raw.flush()

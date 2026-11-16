@@ -14,10 +14,11 @@ import unittest
 from fractions import Fraction
 from pathlib import Path
 from unittest.mock import patch
-from verifierlab.analysis import paired_difference, wilson
+from verifierlab.analysis import audit_answers, paired_difference, replay_group_rewards, wilson
 from verifierlab.audit import reconcile_rows
 from verifierlab.data import grpo_record, make_splits, parse_sample
-from verifierlab.evaluate import aggregate_metrics, score_prediction
+from verifierlab.evaluate import (aggregate_metrics, diagnose_final_answer, explicit_final_metrics,
+                                 score_prediction)
 from verifierlab.experiment import Session, approve, fingerprint, inventory, verify_inventory
 from verifierlab.generate import completion_record, load_frozen, run, score_frozen
 from verifierlab.preflight import check_environment, main as preflight_main
@@ -276,6 +277,76 @@ class EvaluationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             score_prediction('b', '', 'invalid')
 
+    def test_explicit_answer_keeps_conflicts_and_truncation_unresolved(self):
+        cases = [
+            ('The answer is 42.', False, True, None),
+            ('**Final answer:** 84/2.', False, True, None),
+            ('The answer is 42.5.', False, False, None),
+            ('The answer is 4.2e1.', False, True, None),
+            ('Answer: 42. <answer>84/2</answer>', False, True, None),
+            (r'Thus the total is \boxed{42} items.', False, True, None),
+            ('Considered 42. <answer>7</answer>', False, False, None),
+            ('The subtotal is 42.', False, None, 'missing_explicit_answer'),
+            ('The answer is 42 or 7.', False, None, 'unsupported_explicit_answer'),
+            ('The answer is 42. <answer>7</answer>', False, None, 'conflicting_explicit_answers'),
+            (r'\boxed{7} or 42', False, None, 'conflicting_explicit_answers'),
+            ('<answer>7</answer><answer>42', False, None, 'malformed_marker'),
+            ('<answer>42</answer>', True, None, 'truncated'),
+        ]
+        for completion, truncated, correct, reason in cases:
+            with self.subTest(completion=completion, truncated=truncated):
+                row = {**score_prediction('a', completion, '42'), 'truncated': truncated}
+                diagnosis = diagnose_final_answer(row)
+                self.assertIs(diagnosis['explicit_final_correct'], correct)
+                self.assertEqual(diagnosis['explicit_final_uncertainty'], reason)
+
+    def test_replay_grouped_legacy_rows_against_frozen_gold(self):
+        references = {'validation': [{'sample_id': 'train:1', 'ground_truth': '42'}]}
+        texts = ('Final answer: 42', 'Considered 42. <answer>7</answer>', 'The subtotal is 42.')
+        rows = [{**score_prediction(f'train:1#g{i}', text, '42', 20),
+                 'source_sample_id': 'train:1', 'group_member': i, 'truncated': False}
+                for i, text in enumerate(texts)]
+        with tempfile.TemporaryDirectory() as tmp, patch('verifierlab.analysis.prepared_inputs',
+                return_value=(references, {}, {'split_manifest_sha256': 'fixture'})):
+            source = Path(tmp) / 'scored.jsonl'
+            output = Path(tmp) / 'diagnosis'
+            source.write_text(''.join(json.dumps(r) + '\n' for r in rows))
+            summary = audit_answers(source, 'fixture', 'full', 'validation', 3, output)
+            metrics = summary['metrics']['explicit_final']
+            self.assertEqual(metrics['accuracy_given_determined'], 0.5)
+            self.assertEqual(metrics['coverage'], 2 / 3)
+            self.assertEqual(metrics['weak_disagreement_counts'], {
+                'correct_explicit_final': 1, 'wrong_explicit_final': 1, 'undetermined_explicit_final': 1})
+            self.assertEqual(metrics['weak_rewarded_wrong_final_count'], 1)
+            diagnosed = [json.loads(line) for line in (output / 'diagnosed.jsonl').read_text().splitlines()]
+            self.assertEqual([r['weak_accuracy_reward'] for r in diagnosed], [1.0, 1.0, 1.0])
+            self.assertIsNone(explicit_final_metrics([])['coverage'])
+            for invalid_rows in (rows[:2], [*rows[:2], rows[1]],
+                                 [{**rows[0], 'ground_truth': '7'}, *rows[1:]]):
+                source.write_text(''.join(json.dumps(r) + '\n' for r in invalid_rows))
+                with self.assertRaises(ValueError):
+                    audit_answers(source, 'fixture', 'full', 'validation', 3, Path(tmp) / 'invalid')
+
+    def test_group_reward_replay_gains_and_loses_signal(self):
+        rows = []
+        rewarded_wrong = 'Considered 42. <answer>7</answer>'
+        gained_signal = [rewarded_wrong] + ['<answer>7</answer>'] * 3
+        lost_signal = ['<answer>42</answer>'] + [rewarded_wrong] * 3
+        for q, texts in enumerate((gained_signal, lost_signal)):
+            for i, completion in enumerate(texts):
+                row = score_prediction(f'train:{q}#g{i}', completion, '42')
+                rows.append({**row, **diagnose_final_answer(row),
+                             'source_sample_id': f'train:{q}', 'group_member': i})
+        summary, groups = replay_group_rewards(rows, 'full', 4)
+        self.assertEqual(summary['group_signal_counts']['gained_variable_total'], 1)
+        self.assertEqual(summary['group_signal_counts']['lost_variable_total'], 1)
+        self.assertEqual(summary['wrong_explicit_final_disagreement_transitions'], {
+            'zero->positive': 1, 'negative->zero': 3})
+        self.assertEqual(summary['wrong_explicit_final_becomes_positive'], 1)
+        self.assertAlmostEqual(groups[0]['weak']['sample_std'], .5)
+        self.assertAlmostEqual(rows[0]['grpo_replay']['weak']['advantage'], .75 / .5001)
+        self.assertEqual(rows[5]['grpo_replay']['weak']['advantage'], 0)
+
 
 class ExperimentTests(unittest.TestCase):
     def test_identity_is_order_stable_and_changes_with_controls(self):
@@ -380,6 +451,8 @@ class ExperimentTests(unittest.TestCase):
                 summary = analyze(paths, Path(tmp)/'analysis', preparation_dir='fixture')
                 self.assertEqual(summary['missing_conditions'], ['E2','E3'])
                 self.assertEqual(summary['conditions']['E1']['strict_accuracy'], 1)
+                self.assertEqual(summary['paired_explicit_final']['E0->E1']['jointly_determined'], 4)
+                self.assertEqual(summary['paired_weak_rewarded_wrong_final']['E0->E1']['gains'], 0)
             wrong = [{'sample_id':str(i),'ground_truth':'7'} for i in range(4)]
             with patch('verifierlab.analysis.prepared_inputs', return_value=(
                     {'test':wrong}, {}, {'split_manifest_sha256':'manifest'})):

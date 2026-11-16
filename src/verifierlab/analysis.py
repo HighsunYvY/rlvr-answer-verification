@@ -6,7 +6,8 @@ import random
 import statistics
 from collections import Counter
 
-from .evaluate import aggregate_metrics, score_prediction
+from .evaluate import (aggregate_metrics, diagnose_final_answer, explicit_final_metrics,
+                       score_prediction)
 from .verifier import normalize_number, weak_verifier
 from .experiment import ROOT, code_revision, file_identity, prepared_inputs, read_json, verify_inventory, write_json
 
@@ -37,39 +38,145 @@ def paired_difference(left, right, repetitions=2000, seed=42):
             'bootstrap_repetitions': repetitions, 'bootstrap_seed': seed}
 
 
-def analyze(evaluations, output_dir, plot=False, preparation_dir=None, training_runs=None, weak_audit_run=None):
+def diagnose_scored_row(row, gold):
+    expected = score_prediction(row['sample_id'], row['completion'], gold, row['generated_tokens'])
+    if any(key not in row or row[key] != value for key, value in expected.items()):
+        raise ValueError(f"scored verifier fields inconsistent for {row['sample_id']}")
+    if type(row.get('truncated')) is not bool:
+        raise ValueError(f"missing or invalid truncation flag for {row['sample_id']}")
+    return {**row, **diagnose_final_answer(expected | {'truncated': row['truncated']})}
+
+
+def replay_group_rewards(rows, profile, generations):
+    configs = {name: read_json(ROOT / f'configs/grpo_{name}.yaml') for name in ('strict', 'weak')}
+    strict, weak = configs['strict'], configs['weak']
+    weights = strict['reward_weights']
+    if weights != weak['reward_weights'] or len(weights) != 2:
+        raise ValueError('reward replay requires matching format and correctness weights')
+    for name, config in configs.items():
+        trainer = {**config['trainer'], **config['profiles'][profile]}
+        if (trainer['num_generations'] != generations or trainer['scale_rewards'] != 'group'
+                or config['correctness_verifier'] != name or generations < 2):
+            raise ValueError('reward replay requires complete groups and GRPO group scaling')
+
+    groups = {}
+    for row in rows:
+        groups.setdefault(row['source_sample_id'], []).append(row)
+    evidence, counts, transitions = [], Counter(), Counter()
+    for source_id, members in groups.items():
+        members.sort(key=lambda row: row['group_member'])
+        group = {'source_sample_id': source_id, 'sample_ids': [row['sample_id'] for row in members]}
+        for row in members:
+            row['grpo_replay'] = {}
+        for name in configs:
+            correctness = [row[f'{name}_accuracy_reward'] for row in members]
+            rewards = [weights[0] * row['format_reward'] + weights[1] * correct
+                       for row, correct in zip(members, correctness, strict=True)]
+            center, std = statistics.mean(rewards), statistics.stdev(rewards)
+            group[name] = {'mean_reward': center, 'sample_std': std,
+                           'variable_total': std > 0, 'variable_correctness': len(set(correctness)) > 1}
+            for row, reward in zip(members, rewards, strict=True):
+                # TRL 0.24.0, scale_rewards=group. Treat floating-point ties as zero.
+                advantage = 0.0 if math.isclose(reward, center, rel_tol=0, abs_tol=1e-12) else (
+                    (reward - center) / (std + 1e-4))
+                row['grpo_replay'][name] = {
+                    'total_reward': reward, 'advantage': advantage,
+                    'sign': 'positive' if advantage > 0 else 'negative' if advantage < 0 else 'zero'}
+        for metric in ('variable_total', 'variable_correctness'):
+            strict_has_signal, weak_has_signal = group['strict'][metric], group['weak'][metric]
+            counts[f'strict_{metric}'] += strict_has_signal
+            counts[f'weak_{metric}'] += weak_has_signal
+            counts[f'lost_{metric}'] += strict_has_signal and not weak_has_signal
+            counts[f'gained_{metric}'] += weak_has_signal and not strict_has_signal
+        for row in members:
+            if row['weak_disagreement'] == 'wrong_explicit_final':
+                replay = row['grpo_replay']
+                transitions[f"{replay['strict']['sign']}->{replay['weak']['sign']}"] += 1
+        evidence.append(group)
+    return {'groups': len(groups), 'reward_weights': weights, 'scale_rewards': 'group',
+            'trl_formula_version': '0.24.0', 'std_epsilon': 1e-4,
+            'group_signal_counts': dict(counts),
+            'wrong_explicit_final_disagreement_transitions': dict(transitions),
+            'wrong_explicit_final_becomes_positive': transitions['negative->positive']
+            + transitions['zero->positive']}, evidence
+
+
+def audit_answers(predictions, preparation_dir, profile, split, generations, output_dir, replay_grpo=False):
+    """Re-score a complete frozen split, with one row per question or sampled group member."""
+    if type(generations) is not int or generations < 1:
+        raise ValueError('generations per question must be a positive integer')
+    splits, _, preparation = prepared_inputs(preparation_dir, profile)
+    gold = {r['sample_id']: r['ground_truth'] for r in splits[split]}
+    rows, members = [], set()
+    with Path(predictions).open() as stream:
+        for line in stream:
+            row = json.loads(line)
+            identifier = row['sample_id']
+            source_id = row.get('source_sample_id', identifier)
+            member = row.get('group_member', 0)
+            if (source_id not in gold or type(member) is not int
+                    or not 0 <= member < generations or (source_id, member) in members):
+                raise ValueError(f'duplicate or unexpected prediction identity: {identifier}')
+            expected_id = source_id if generations == 1 else f'{source_id}#g{member}'
+            if identifier != expected_id:
+                raise ValueError(f'prediction ID does not match its source and group member: {identifier}')
+            members.add((source_id, member))
+            rows.append(diagnose_scored_row(row, gold[source_id]))
+    if len(members) != len(gold) * generations or not rows:
+        raise ValueError('predictions must cover every member of the frozen split')
+
+    summary = {'profile': profile, 'split': split, 'questions': len(gold),
+               'generations_per_question': generations,
+               'manifest_sha256': preparation['split_manifest_sha256'],
+               'predictions': str(Path(predictions).resolve()),
+               'metrics': {**aggregate_metrics(rows), 'explicit_final': explicit_final_metrics(rows)}}
+    if replay_grpo:
+        summary['grpo_replay'], reward_groups = replay_group_rewards(rows, profile, generations)
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=False)
+    with (out / 'diagnosed.jsonl').open('x') as stream:
+        for row in rows:
+            stream.write(json.dumps(row, ensure_ascii=False) + '\n')
+    if replay_grpo:
+        write_json(out / 'reward-groups.json', reward_groups)
+    write_json(out / 'metrics.json', summary)
+    return summary
+
+
+def analyze(evaluations, output_dir, plot=False, preparation_dir=None, training_runs=None,
+            weak_audit_run=None, split='test'):
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=False)
     reports, rows = {}, {}
     try:
-        if not {'E0','E1'} <= set(evaluations) or not set(evaluations) <= {'E0','E1','E2','E3'}:
-            raise ValueError('E0/E1 evaluations required; E2/E3 may be absent for negative results')
+        if split not in ('test', 'validation'):
+            raise ValueError('paired analysis requires test or validation evaluations')
+        required = {'E0', 'E1'} if split == 'test' else {'E1'}
+        if not required <= set(evaluations) <= {'E0', 'E1', 'E2', 'E3'}:
+            raise ValueError(f'{split} analysis requires evaluations for {sorted(required)}')
         for stage, directory in evaluations.items():
             directory = Path(directory)
             report = read_json(directory / 'run.json')
             verify_inventory(directory, report['artifacts'])
             if (report['status'] != 'passed' or report['stage'] != stage + '_eval'
-                    or report['settings']['split'] != 'test'):
-                raise ValueError('complete held-out test evaluation required')
+                    or report['settings']['split'] != split):
+                raise ValueError(f'complete {split} evaluation required')
             data = [json.loads(line) for line in (directory / 'scored.jsonl').read_text().splitlines()]
             if not data or len({r['sample_id'] for r in data}) != len(data):
                 raise ValueError('empty or duplicate sample IDs')
-            for r in data:
-                expected = score_prediction(r['sample_id'], r['completion'], r['ground_truth'], r['generated_tokens'])
-                if any(r[k] != v for k, v in expected.items()):
-                    raise ValueError('scored verifier fields inconsistent')
             reports[stage], rows[stage] = report, data
-        base = reports['E0']
+        base_stage = 'E0' if 'E0' in reports else 'E1'
+        base = reports[base_stage]
         if not preparation_dir:
             raise ValueError('analysis requires the frozen preparation, never prediction-supplied gold alone')
         frozen, _, prep = prepared_inputs(preparation_dir, base['profile'])
-        expected = frozen['test'][:4] if base['mode'] == 'smoke' else frozen['test']
+        expected = frozen[split][:4] if base['mode'] == 'smoke' else frozen[split]
         if (prep['split_manifest_sha256'] != base['manifest_sha256']
-                or [r['sample_id'] for r in rows['E0']] != [r['sample_id'] for r in expected]
-                or [r['ground_truth'] for r in rows['E0']] != [r['ground_truth'] for r in expected]):
+                or [r['sample_id'] for r in rows[base_stage]] != [r['sample_id'] for r in expected]
+                or [r['ground_truth'] for r in rows[base_stage]] != [r['ground_truth'] for r in expected]):
             raise ValueError('analysis frozen ID/gold mismatch')
-        ids = [r['sample_id'] for r in rows['E0']]
-        gold = [r['ground_truth'] for r in rows['E0']]
+        ids = [r['sample_id'] for r in rows[base_stage]]
+        gold = [r['ground_truth'] for r in rows[base_stage]]
         for stage in evaluations:
             report = reports[stage]
             if (report['manifest_sha256'] != base['manifest_sha256'] or report['settings'] != base['settings']
@@ -93,9 +200,12 @@ def analyze(evaluations, output_dir, plot=False, preparation_dir=None, training_
                 reports['E2']['policy_identity']['training_contract'] != reports['E3']['policy_identity']['training_contract']):
             raise ValueError('E2/E3 training controls differ')
         summary = {'analysis_code': code_revision(ROOT),
-                   'analysis_source_sha256': file_identity(Path(__file__))['sha256'], 'n': len(ids), 'profile': base['profile'], 'mode': base['mode'],
+                   'analysis_source_sha256': file_identity(Path(__file__))['sha256'], 'n': len(ids),
+                   'split': split, 'profile': base['profile'], 'mode': base['mode'],
                    'manifest_sha256': base['manifest_sha256'], 'conditions': {}, 'paired': {},
+                   'paired_explicit_final': {}, 'paired_weak_rewarded_wrong_final': {},
                    'limitations': ['Operational numeric final-answer scoring is not proof of valid reasoning.',
+                     'Explicit-final accuracy is conditional on parser coverage; paired comparisons use jointly determined answers.',
                      'Bootstrap intervals and paired tests describe one frozen seed/sample set.',
                      'Reward improvement and verifier disagreements alone do not establish policy exploitation.'],
                    'inputs': {s: file_identity(Path(d) / 'run.json')['sha256'] for s, d in evaluations.items()}}
@@ -123,8 +233,11 @@ def analyze(evaluations, output_dir, plot=False, preparation_dir=None, training_
         frozen_lookup = {r['sample_id']: r for r in expected}
         errors = []
         for stage, data in rows.items():
+            data = [diagnose_scored_row(r, frozen_lookup[r['sample_id']]['ground_truth']) for r in data]
+            rows[stage] = data
             metrics = aggregate_metrics(data)
             metrics.update(strict_accuracy_wilson_ci95=wilson(sum(r['strict_correct'] for r in data), len(data)),
+                           explicit_final=explicit_final_metrics(data),
                            truncation_rate=sum(r['truncated'] for r in data)/len(data),
                            median_tokens=statistics.median(r['generated_tokens'] for r in data),
                            p95_generated_tokens=sorted(r['generated_tokens'] for r in data)[math.ceil(.95*len(data))-1],
@@ -133,7 +246,7 @@ def analyze(evaluations, output_dir, plot=False, preparation_dir=None, training_
                            mean_weak_total_reward=statistics.mean(.2*r['format_reward']+r['weak_accuracy_reward'] for r in data))
             summary['conditions'][stage] = metrics
             for r in data:
-                if not r['strict_correct'] or r['truncated']:
+                if not r['strict_correct'] or r['explicit_final_correct'] is not True:
                     question = frozen_lookup[r['sample_id']]['prompt'][1]['content']
                     final_value = r['parsed_answer']
                     errors.append({'stage': stage, **r,
@@ -145,14 +258,34 @@ def analyze(evaluations, output_dir, plot=False, preparation_dir=None, training_
                 continue
             summary['paired'][f'{left}->{right}'] = paired_difference(
                 [r['strict_correct'] for r in rows[left]], [r['strict_correct'] for r in rows[right]])
+            jointly_determined = [(a['explicit_final_correct'], b['explicit_final_correct'])
+                                  for a, b in zip(rows[left], rows[right], strict=True)
+                                  if a['explicit_final_correct'] is not None
+                                  and b['explicit_final_correct'] is not None]
+            comparison = paired_difference(*zip(*jointly_determined)) if jointly_determined else None
+            summary['paired_explicit_final'][f'{left}->{right}'] = {
+                'jointly_determined': len(jointly_determined), 'total_pairs': len(ids),
+                'comparison': comparison}
+            summary['paired_weak_rewarded_wrong_final'][f'{left}->{right}'] = paired_difference(*[
+                [r['weak_positive'] and r['explicit_final_correct'] is False for r in rows[stage]]
+                for stage in (left, right)])
         with (out / 'errors.jsonl').open('x') as stream:
             for r in errors:
                 stream.write(json.dumps(r, ensure_ascii=False)+'\n')
         write_json(out / 'summary.json', summary)
-        lines = ['# Paired E0-E3 evaluation', '', f"Frozen samples: {len(ids)}; profile: {base['profile']}; mode: {base['mode']}.", '',
+        lines = ['# Paired E0-E3 evaluation', '', f"Frozen {split} samples: {len(ids)}; profile: {base['profile']}; mode: {base['mode']}.", '',
                  '| Condition | Strict accuracy | Format | Weak FP share | Truncation |', '|---|---:|---:|---:|---:|']
         for stage, m in summary['conditions'].items():
             lines.append(f"| {stage} | {m['strict_accuracy']:.4f} | {m['format_rate']:.4f} | {m['weak_false_positive_share']:.4f} | {m['truncation_rate']:.4f} |")
+        lines += ['', '## Explicit final answers', '',
+                  '| Condition | Accuracy on determined | Coverage | Undetermined | Weak-rewarded wrong finals |',
+                  '|---|---:|---:|---:|---:|']
+        for stage, m in summary['conditions'].items():
+            final = m['explicit_final']
+            determined = final['correct'] + final['wrong']
+            accuracy = f"{final['correct']}/{determined}" if determined else 'N/A'
+            lines.append(f"| {stage} | {accuracy} | {final['coverage']:.1%} | {final['undetermined']} | "
+                         f"{final['weak_rewarded_wrong_final_count']} |")
         lines += ['', '## Paired changes', '']
         for pair, result in summary['paired'].items():
             lines.append(f"- {pair}: delta={result['difference_right_minus_left']:.4f}, paired bootstrap 95% CI={result['paired_bootstrap_ci95']}, exact McNemar p={result['exact_mcnemar_p_two_sided']:.6g}.")

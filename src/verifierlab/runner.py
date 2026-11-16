@@ -2,7 +2,7 @@
 import argparse
 import json
 
-from .analysis import analyze
+from .analysis import analyze, audit_answers
 from .experiment import approve
 from .rollouts import approve_weak, run_rollouts
 from .training import train
@@ -30,6 +30,8 @@ def main():
             cmd.add_argument('--checkpoint-dir')
             if name == 'evaluate':
                 cmd.add_argument('--split', choices=['test','validation'], default='test')
+                cmd.add_argument('--sampled-validation', action='store_true',
+                                 help='generate groups with the weak-audit sampling settings')
     for name in ('admit', 'admit-weak'):
         cmd = sub.add_parser(name)
         cmd.add_argument('--run-dir', required=True)
@@ -37,13 +39,22 @@ def main():
         cmd.add_argument('--review-note', required=True)
     cmd = sub.add_parser('analyze')
     for stage in ('e0', 'e1', 'e2', 'e3'):
-        cmd.add_argument('--'+stage, required=stage in ('e0','e1'))
+        cmd.add_argument('--'+stage, required=stage == 'e1')
         if stage != 'e0':
             cmd.add_argument('--'+stage+'-training-run')
     cmd.add_argument('--output-dir', required=True)
     cmd.add_argument('--preparation-dir', required=True)
     cmd.add_argument('--plot', action='store_true')
     cmd.add_argument('--weak-audit-run')
+    cmd.add_argument('--split', choices=['test', 'validation'], default='test')
+    cmd = sub.add_parser('audit-answers', help='diagnose a complete scored split without loading a model')
+    cmd.add_argument('--predictions', required=True, help='existing scored JSONL, including truncation flags')
+    cmd.add_argument('--preparation-dir', required=True, help='preparation directory for the same frozen split')
+    cmd.add_argument('--profile', choices=['smoke', 'pilot', 'full'], required=True)
+    cmd.add_argument('--split', choices=['validation', 'test'], required=True)
+    cmd.add_argument('--generations-per-question', type=int, default=1)
+    cmd.add_argument('--replay-grpo', action='store_true', help='compare group-scaled strict and weak advantages')
+    cmd.add_argument('--output-dir', required=True)
     args = parser.parse_args()
     if args.command == 'train':
         result = train(args.stage, args.preparation_dir, args.model_dir, args.output_dir,
@@ -53,15 +64,19 @@ def main():
         result = run_rollouts(args.preparation_dir, args.model_dir, args.output_dir,
                     args.profile, args.mode, args.checkpoint_dir, args.sft_run,
                     'validation' if args.command == 'weak-audit' else args.split,
-                    args.admission, args.command == 'weak-audit')
+                    args.admission, weak_audit=args.command == 'weak-audit',
+                    sampled_validation=getattr(args, 'sampled_validation', False))
     elif args.command in ('admit', 'admit-weak'):
         operation = approve if args.command == 'admit' else approve_weak
         result = operation(args.run_dir, args.output, args.review_note)
+    elif args.command == 'audit-answers':
+        result = audit_answers(args.predictions, args.preparation_dir, args.profile, args.split,
+                               args.generations_per_question, args.output_dir, args.replay_grpo)
     else:
         result = analyze({s: getattr(args,s.lower()) for s in ('E0','E1','E2','E3') if getattr(args,s.lower())},
                          args.output_dir, args.plot, args.preparation_dir,
                          {s: getattr(args,s.lower()+'_training_run') for s in ('E1','E2','E3')
-                          if getattr(args,s.lower()+'_training_run')}, args.weak_audit_run)
+                          if getattr(args,s.lower()+'_training_run')}, args.weak_audit_run, split=args.split)
     print(json.dumps(result, indent=2))
 
 
