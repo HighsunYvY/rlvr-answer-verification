@@ -47,6 +47,23 @@ def diagnose_scored_row(row, gold):
     return {**row, **diagnose_final_answer(expected | {'truncated': row['truncated']})}
 
 
+def group_reward_evidence(rows, verifier, weights):
+    correctness = [row[f'{verifier}_accuracy_reward'] for row in rows]
+    rewards = [weights[0] * row['format_reward'] + weights[1] * correct
+               for row, correct in zip(rows, correctness, strict=True)]
+    center, std = statistics.mean(rewards), statistics.stdev(rewards)
+    evidence = {'mean_reward': center, 'sample_std': std,
+                'variable_total': std > 0, 'variable_correctness': len(set(correctness)) > 1}
+    members = []
+    for reward in rewards:
+        # TRL 0.24.0, scale_rewards=group. Treat floating-point ties as zero.
+        advantage = 0.0 if math.isclose(reward, center, rel_tol=0, abs_tol=1e-12) else (
+            (reward - center) / (std + 1e-4))
+        members.append({'total_reward': reward, 'advantage': advantage,
+                        'sign': 'positive' if advantage > 0 else 'negative' if advantage < 0 else 'zero'})
+    return evidence, members
+
+
 def replay_group_rewards(rows, profile, generations):
     configs = {name: read_json(ROOT / f'configs/grpo_{name}.yaml') for name in ('strict', 'weak')}
     strict, weak = configs['strict'], configs['weak']
@@ -69,19 +86,9 @@ def replay_group_rewards(rows, profile, generations):
         for row in members:
             row['grpo_replay'] = {}
         for name in configs:
-            correctness = [row[f'{name}_accuracy_reward'] for row in members]
-            rewards = [weights[0] * row['format_reward'] + weights[1] * correct
-                       for row, correct in zip(members, correctness, strict=True)]
-            center, std = statistics.mean(rewards), statistics.stdev(rewards)
-            group[name] = {'mean_reward': center, 'sample_std': std,
-                           'variable_total': std > 0, 'variable_correctness': len(set(correctness)) > 1}
+            group[name], rewards = group_reward_evidence(members, name, weights)
             for row, reward in zip(members, rewards, strict=True):
-                # TRL 0.24.0, scale_rewards=group. Treat floating-point ties as zero.
-                advantage = 0.0 if math.isclose(reward, center, rel_tol=0, abs_tol=1e-12) else (
-                    (reward - center) / (std + 1e-4))
-                row['grpo_replay'][name] = {
-                    'total_reward': reward, 'advantage': advantage,
-                    'sign': 'positive' if advantage > 0 else 'negative' if advantage < 0 else 'zero'}
+                row['grpo_replay'][name] = reward
         for metric in ('variable_total', 'variable_correctness'):
             strict_has_signal, weak_has_signal = group['strict'][metric], group['weak'][metric]
             counts[f'strict_{metric}'] += strict_has_signal

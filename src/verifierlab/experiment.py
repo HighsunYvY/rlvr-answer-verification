@@ -167,7 +167,7 @@ class Session:
             ['nvidia-smi', '--query-gpu=driver_version', '--format=csv,noheader'], text=True).splitlines()
         with (self.out / 'nvidia-smi.txt').open('x') as stream:
             subprocess.run(['nvidia-smi'], stdout=stream, stderr=subprocess.STDOUT, check=True)
-        set_seed(42)
+        set_seed(settings['seed'])
         self.tokenizer = AutoTokenizer.from_pretrained(str(self.model_dir), local_files_only=True,
                                                       trust_remote_code=False, padding_side='left')
         if not self.tokenizer.chat_template or self.tokenizer.eos_token_id is None:

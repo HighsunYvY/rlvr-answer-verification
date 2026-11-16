@@ -6,6 +6,7 @@ from .analysis import analyze, audit_answers
 from .experiment import approve
 from .rollouts import approve_weak, run_rollouts
 from .training import train
+from .training_audit import audit_training
 
 
 def main():
@@ -26,6 +27,8 @@ def main():
             cmd.add_argument('--resume-from-checkpoint')
             cmd.add_argument('--max-steps', type=int,
                              help='GRPO step budget override; requires matching smoke admission')
+            cmd.add_argument('--training-seed', type=int,
+                             help='set E2/E3 model and data-loader seeds for one paired run')
         else:
             cmd.add_argument('--checkpoint-dir')
             if name == 'evaluate':
@@ -55,11 +58,17 @@ def main():
     cmd.add_argument('--generations-per-question', type=int, default=1)
     cmd.add_argument('--replay-grpo', action='store_true', help='compare group-scaled strict and weak advantages')
     cmd.add_argument('--output-dir', required=True)
+    cmd = sub.add_parser('audit-training', help='replay the reward signal from an archived E2/E3 training run')
+    cmd.add_argument('--run-dir', required=True)
+    cmd.add_argument('--preparation-dir', required=True)
+    cmd.add_argument('--output-dir', required=True)
+    cmd.add_argument('--window-steps', type=int, default=25)
     args = parser.parse_args()
     if args.command == 'train':
         result = train(args.stage, args.preparation_dir, args.model_dir, args.output_dir,
                        args.profile, args.mode, args.sft_run, args.admission,
-                       args.weak_admission, args.resume_from_checkpoint, max_steps=args.max_steps)
+                       args.weak_admission, args.resume_from_checkpoint, max_steps=args.max_steps,
+                       training_seed=args.training_seed)
     elif args.command in ('evaluate','weak-audit'):
         result = run_rollouts(args.preparation_dir, args.model_dir, args.output_dir,
                     args.profile, args.mode, args.checkpoint_dir, args.sft_run,
@@ -72,6 +81,8 @@ def main():
     elif args.command == 'audit-answers':
         result = audit_answers(args.predictions, args.preparation_dir, args.profile, args.split,
                                args.generations_per_question, args.output_dir, args.replay_grpo)
+    elif args.command == 'audit-training':
+        result = audit_training(args.run_dir, args.preparation_dir, args.output_dir, args.window_steps)
     else:
         result = analyze({s: getattr(args,s.lower()) for s in ('E0','E1','E2','E3') if getattr(args,s.lower())},
                          args.output_dir, args.plot, args.preparation_dir,

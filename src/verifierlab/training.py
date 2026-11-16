@@ -143,18 +143,25 @@ def trace_reward(dataset_rows, out, verifier, generations, tokenizer=None, limit
 
 
 def train(stage, preparation_dir, model_dir, output_dir, profile='smoke', mode='smoke',
-          sft_dir=None, approval=None, weak_admission=None, resume=None, max_steps=None):
+          sft_dir=None, approval=None, weak_admission=None, resume=None, max_steps=None,
+          training_seed=None):
     if stage not in ('E1', 'E2', 'E3'):
         raise ValueError('unknown optimization stage')
     if max_steps is not None and (stage == 'E1' or type(max_steps) is not int or max_steps < 2):
         raise ValueError('max_steps override requires E2/E3 and an integer of at least two')
+    if training_seed is not None and (stage == 'E1' or type(training_seed) is not int
+                                      or not 0 <= training_seed < 2 ** 32):
+        raise ValueError('training seed override requires E2/E3 and an unsigned 32-bit integer')
     filename = {'E1': 'sft', 'E2': 'grpo_strict', 'E3': 'grpo_weak'}[stage]
     source = read_json(ROOT / f'configs/{filename}.yaml')
     trainer_settings = {**source['trainer'], **source['profiles'][profile]}
     budget = trainer_settings.pop('max_steps')
     if max_steps is not None:
         budget = max_steps
-    settings = {'trainer': trainer_settings, 'lora': source['lora'], 'seed': source['seed'],
+    seed = source['seed'] if training_seed is None else training_seed
+    if training_seed is not None:
+        trainer_settings.update(seed=seed, data_seed=seed)
+    settings = {'trainer': trainer_settings, 'lora': source['lora'], 'seed': seed,
                 'reward_weights': source.get('reward_weights'), 'max_steps': budget,
                 'forward_probe': dict(FORWARD_PROBE)}
     # Step count belongs to the declared budget, not mode: smoke and run must match the same signature.
