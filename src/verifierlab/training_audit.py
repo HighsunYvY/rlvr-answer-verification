@@ -1,4 +1,4 @@
-"""Replay the logged GRPO reward signal for completed E2/E3 training runs."""
+"""Replay the logged GRPO reward signal for completed GRPO runs."""
 import json
 from collections import Counter
 from itertools import islice
@@ -6,13 +6,17 @@ from pathlib import Path
 
 from .analysis import diagnose_scored_row, group_reward_evidence
 from .experiment import prepared_inputs, read_json, verify_inventory, write_json
-from .rewards import completion_text
+from .rewards import completion_text, shuffled_weak_rewards
 
 
 def audit_group(rows, verifier, weights, recorded):
     strict, strict_members = group_reward_evidence(rows, 'strict', weights)
     weak, weak_members = group_reward_evidence(rows, 'weak', weights)
     applied, applied_members = (strict, strict_members) if verifier == 'strict' else (weak, weak_members)
+    if verifier == 'shuffled_weak':
+        applied, applied_members = group_reward_evidence(rows, verifier, weights)
+        if sorted(r['total_reward'] for r in applied_members) != sorted(r['total_reward'] for r in weak_members):
+            raise ValueError('E4 total-reward multiset differs from weak on the same group')
     if (recorded['selected_total_rewards'] != [r['total_reward'] for r in applied_members]
             or recorded['variable_selected_total'] != applied['variable_total']):
         raise ValueError('replayed rewards differ from the logged trainer rewards')
@@ -36,6 +40,8 @@ def audit_group(rows, verifier, weights, recorded):
         counts['weak_rewarded_wrong_positive_under_applied'] += paid_wrong and actual['sign'] == 'positive'
         counts['correct_positive_under_applied'] += correct is True and actual['sign'] == 'positive'
         counts['wrong_positive_under_applied'] += correct is False and actual['sign'] == 'positive'
+        if verifier == 'shuffled_weak':
+            counts['reassigned_correctness_awards'] += row['weak_accuracy_reward'] == 0 and row['shuffled_weak_accuracy_reward'] == 1
         if positive_paid_wrong:
             if best_correct is None:
                 comparison = 'no_explicit_correct'
@@ -49,6 +55,8 @@ def audit_group(rows, verifier, weights, recorded):
         members.append({'sample_id': row['sample_id'], 'explicit_final_answer': row['explicit_final_answer'],
                         'explicit_final_correct': correct, 'weak_positive': row['weak_positive'],
                         'truncated': row['truncated'], 'strict': s, 'weak': w})
+        if verifier == 'shuffled_weak':
+            members[-1]['shuffled_weak'] = actual
     return counts, {'strict': strict, 'weak': weak, 'members': members}
 
 
@@ -62,14 +70,14 @@ def audit_training(run_dir, preparation_dir, output_dir, window_steps=25):
     steps = report['optimizer_steps']
     generations = resolved['num_generations']
     weights = report['settings']['reward_weights']
-    verifier = {'E2': 'strict', 'E3': 'weak'}.get(stage)
+    verifier = {'E2': 'strict', 'E3': 'weak', 'E4': 'shuffled_weak'}.get(stage)
     if (not verifier or report['status'] != 'passed' or report['mode'] != 'run'
             or not report['trainer_validated'] or report.get('resumed_report_sha256')
             or report['environment']['packages']['trl']['installed'] != '0.24.0'
             or resolved['scale_rewards'] != 'group' or resolved['num_iterations'] != 1
             or resolved['mask_truncated_completions'] is not False
             or generations < 2 or len(weights) != 2 or steps != report['settings']['max_steps']):
-        raise ValueError('replay requires a complete fresh TRL 0.24.0 E2/E3 run with group-scaled rewards')
+        raise ValueError('replay requires a complete fresh TRL 0.24.0 GRPO run with group-scaled rewards')
 
     splits, _, preparation = prepared_inputs(preparation_dir, report['profile'])
     if report['manifest_sha256'] != preparation['split_manifest_sha256']:
@@ -117,6 +125,11 @@ def audit_training(run_dir, preparation_dir, output_dir, window_steps=25):
                 if partition == 'validation':
                     validation_rows += generations
                     continue
+                if verifier == 'shuffled_weak':
+                    shuffled = shuffled_weak_rewards(members, report['settings']['seed'], partition,
+                                                     step, source_id, group_index)
+                    if shuffled != [row['shuffled_weak_accuracy_reward'] for row in members]:
+                        raise ValueError(f'E4 deterministic assignment differs at call {call_id}')
                 counts, evidence = audit_group(members, verifier, weights, group)
                 total.update(counts)
                 windows.setdefault(step // window_steps, Counter()).update(counts)

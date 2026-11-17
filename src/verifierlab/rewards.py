@@ -1,4 +1,6 @@
 """TRL v0.24.0 keyword callback contract; all component rewards are in [0, 1]."""
+from random import Random
+
 from .verifier import format_compliant, strict_verifier, weak_verifier
 
 
@@ -36,3 +38,34 @@ def strict_accuracy_reward(completions, ground_truth, **kwargs):
 
 def weak_accuracy_reward(completions, ground_truth, **kwargs):
     return _accuracy(completions, ground_truth, weak_verifier)
+
+
+def weak_shuffle_pools(rows):
+    """Group indices of strict failures by their format score within one prompt."""
+    pools = {}
+    for index, row in enumerate(rows):
+        if not row['strict_correct']:
+            pools.setdefault(row['format_reward'], []).append(index)
+    return pools.values()
+
+
+def shuffled_weak_rewards(rows, seed, partition, step, sample_id, group_index):
+    """Permute weak correctness among strict failures without changing total-reward multiplicities."""
+    rng = Random(f'weak-shuffle-v1:{seed}:{partition}:{step}:{sample_id}:{group_index}')
+    rewards = [row['weak_accuracy_reward'] for row in rows]
+    for pool in weak_shuffle_pools(rows):
+        shuffled = [rewards[index] for index in pool]
+        rng.shuffle(shuffled)
+        for index, reward in zip(pool, shuffled, strict=True):
+            rewards[index] = reward
+    return rewards
+
+
+def weak_shuffle_probabilities(rows):
+    """Probability of each row receiving correctness reward one under the permutation."""
+    probabilities = [row['weak_accuracy_reward'] for row in rows]
+    for pool in weak_shuffle_pools(rows):
+        rate = sum(probabilities[index] for index in pool) / len(pool)
+        for index in pool:
+            probabilities[index] = rate
+    return probabilities

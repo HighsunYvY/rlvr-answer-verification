@@ -105,7 +105,7 @@ def load_policy(model_dir, checkpoint_dir=None, sft_dir=None, trainable=False, m
                 trust_remote_code=False, dtype=torch.bfloat16, attn_implementation='sdpa')
     if checkpoint_dir:
         meta = checkpoint(checkpoint_dir, require_passed=not allow_unvalidated)
-        if meta['stage'] in ('E2', 'E3'):
+        if meta['stage'] in ('E2', 'E3', 'E4'):
             if not sft_dir or checkpoint(sft_dir)['adapter_sha256'] != meta['sft_identity']:
                 raise ValueError('RL checkpoint requires its exact original E1 checkpoint')
             if checkpoint(sft_dir)['stage'] != 'E1':
@@ -269,7 +269,7 @@ def validate_smoke(directory, report):
     if not all(type(gpu[k]) is int and gpu[k] > 0 for k in ('peak_allocated_bytes','peak_reserved_bytes','total_bytes')):
         raise ValueError('real GPU memory evidence missing')
     stage = report['stage']
-    if stage in ('E1','E2','E3'):
+    if stage in ('E1','E2','E3','E4'):
         required = {'checkpoint.json','gradients.jsonl','reload-logits.pt','trainer-log.json'}
         if not required <= set(report['artifacts']) or not report['trainer_validated'] or report['optimizer_steps'] != 2:
             raise ValueError('Trainer update/reload evidence missing')
@@ -287,9 +287,9 @@ def validate_smoke(directory, report):
                 or any('has_gradient_signal' in e
                        and e['has_gradient_signal'] != (e['gradient_norm'] > 0) for e in events)):
             raise ValueError('gradient signal counts inconsistent with recorded events')
-        if stage in ('E2','E3') and not {'reference-logits.pt','reward-rollouts.jsonl','reward-groups.jsonl'} <= set(report['artifacts']):
+        if stage in ('E2','E3','E4') and not {'reference-logits.pt','reward-rollouts.jsonl','reward-groups.jsonl'} <= set(report['artifacts']):
             raise ValueError('GRPO reference/group evidence missing')
-    elif stage in ('E0_eval','E1_eval','E2_eval','E3_eval','weak_audit'):
+    elif stage in ('E0_eval','E1_eval','E2_eval','E3_eval','E4_eval','weak_audit'):
         if not {'raw.jsonl','scored.jsonl','metrics.json'} <= set(report['artifacts']) or not report['model_generation_validated']:
             raise ValueError('model generation evidence missing')
         raw = (directory/'raw.jsonl').read_text().splitlines()

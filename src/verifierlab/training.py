@@ -9,7 +9,7 @@ from .data import grpo_record
 from .evaluate import score_prediction
 from .experiment import (ROOT, checkpoint, file_identity, load_policy, read_json,
                          save_checkpoint, session, verify_inventory, write_json)
-from .rewards import completion_text, format_reward
+from .rewards import completion_text, format_reward, shuffled_weak_rewards
 from .rollouts import group_signal, require_weak_admission
 from .sft import inspect_labels, tokenize_completion
 from .generate import completion_record
@@ -92,14 +92,15 @@ def evidence_callback(params, out, torch, allow_zero=False):
     return Evidence()
 
 
-def trace_reward(dataset_rows, out, verifier, generations, tokenizer=None, limit=None):
+def trace_reward(dataset_rows, out, verifier, generations, tokenizer=None, limit=None, shuffle_seed=None):
     lookup = {r['sample_id']: r for r in dataset_rows}
     calls = []
 
     def correctness(completions, ground_truth, sample_id, prompts, completion_ids, partition, **kwargs):
         n = len(completions)
+        step = getattr(kwargs.get('trainer_state'), 'global_step', None)
         with (out / 'reward-inputs.jsonl').open('a') as stream:
-            stream.write(json.dumps({'call': len(calls), 'optimizer_step': getattr(kwargs.get('trainer_state'), 'global_step', None), 'prompts': prompts, 'completions': completions,
+            stream.write(json.dumps({'call': len(calls), 'optimizer_step': step, 'prompts': prompts, 'completions': completions,
                 'ground_truth': ground_truth, 'sample_id': sample_id, 'partition': partition,
                 'completion_ids': completion_ids}, ensure_ascii=False) + '\n')
         if n == 0 or not (n == len(sample_id) == len(ground_truth) == len(prompts) == len(completion_ids) == len(partition)) or n % generations:
@@ -125,11 +126,19 @@ def trace_reward(dataset_rows, out, verifier, generations, tokenizer=None, limit
             if len(set(sample_id[i:i + generations])) != 1:
                 raise ValueError('GRPO group ordering mismatch')
             members = rows[i:i + generations]
+            if verifier == 'shuffled_weak':
+                shuffled = shuffled_weak_rewards(members, shuffle_seed, partition[i], step,
+                                                 sample_id[i], i // generations)
+                for row, reward in zip(members, shuffled, strict=True):
+                    row['shuffled_weak_accuracy_reward'] = reward
             total = [0.2 * r['format_reward'] + r[f'{verifier}_accuracy_reward'] for r in members]
+            weak_signal = group_signal(members)
+            if verifier == 'shuffled_weak' and sorted(total) != sorted(weak_signal['total_rewards']):
+                raise RuntimeError('E4 changed the total-reward multiset')
             groups.append({'sample_id': sample_id[i], 'partition': partition[i], 'selected_total_rewards': total,
                            'variable_selected_total': len(set(total)) > 1,
-                           'weak_signal': group_signal(members)})
-        call = {'call': len(calls), 'optimizer_step': getattr(kwargs.get('trainer_state'), 'global_step', None), 'groups': groups}
+                           'weak_signal': weak_signal})
+        call = {'call': len(calls), 'optimizer_step': step, 'groups': groups}
         calls.append(call)
         with (out / 'reward-rollouts.jsonl').open('a') as stream:
             for row in rows:
@@ -145,15 +154,15 @@ def trace_reward(dataset_rows, out, verifier, generations, tokenizer=None, limit
 def train(stage, preparation_dir, model_dir, output_dir, profile='smoke', mode='smoke',
           sft_dir=None, approval=None, weak_admission=None, resume=None, max_steps=None,
           training_seed=None):
-    if stage not in ('E1', 'E2', 'E3'):
+    filenames = {'E1': 'sft', 'E2': 'grpo_strict', 'E3': 'grpo_weak', 'E4': 'grpo_weak'}
+    if stage not in filenames:
         raise ValueError('unknown optimization stage')
     if max_steps is not None and (stage == 'E1' or type(max_steps) is not int or max_steps < 2):
-        raise ValueError('max_steps override requires E2/E3 and an integer of at least two')
+        raise ValueError('max_steps override requires a GRPO stage and an integer of at least two')
     if training_seed is not None and (stage == 'E1' or type(training_seed) is not int
                                       or not 0 <= training_seed < 2 ** 32):
-        raise ValueError('training seed override requires E2/E3 and an unsigned 32-bit integer')
-    filename = {'E1': 'sft', 'E2': 'grpo_strict', 'E3': 'grpo_weak'}[stage]
-    source = read_json(ROOT / f'configs/{filename}.yaml')
+        raise ValueError('training seed override requires a GRPO stage and an unsigned 32-bit integer')
+    source = read_json(ROOT / f'configs/{filenames[stage]}.yaml')
     trainer_settings = {**source['trainer'], **source['profiles'][profile]}
     budget = trainer_settings.pop('max_steps')
     if max_steps is not None:
@@ -169,7 +178,7 @@ def train(stage, preparation_dir, model_dir, output_dir, profile='smoke', mode='
         raise ValueError('E1 initializes from original Instruct, not another adapter')
     sft_meta = checkpoint(sft_dir) if sft_dir else None
     if stage != 'E1' and (not sft_meta or sft_meta['stage'] != 'E1'):
-        raise ValueError('E2/E3 must independently initialize from an E1 checkpoint')
+        raise ValueError('GRPO stages must independently initialize from an E1 checkpoint')
     with session(output_dir, stage, profile, mode, model_dir, preparation_dir) as current:
         current.initialize(settings, sft_meta)
         sources = current.report['sources']
@@ -183,7 +192,7 @@ def train(stage, preparation_dir, model_dir, output_dir, profile='smoke', mode='
                     or sft_meta['training_contract']['effective_steps'] != sft_meta['training_contract']['settings']['max_steps']):
                 raise ValueError('pilot/full GRPO requires the completed target-profile E1 budget')
         current.admit(approval)
-        if stage == 'E3':
+        if stage in ('E3', 'E4'):
             require_weak_admission(weak_admission, current, sft_meta)
         torch, tokenizer = current.torch, current.tokenizer
         from datasets import Dataset
@@ -232,7 +241,10 @@ def train(stage, preparation_dir, model_dir, output_dir, profile='smoke', mode='
             reference_logits = forward_probe(model, probe, torch)
             effective = {**source, 'trainer': kwargs}
             current.report['batch_validation'] = validate_grpo(effective, 1)
-            correctness, calls = trace_reward(rows + validation, current.out, source['correctness_verifier'], kwargs['num_generations'], tokenizer, kwargs['max_completion_length'])
+            verifier = 'shuffled_weak' if stage == 'E4' else source['correctness_verifier']
+            current.report['applied_correctness_verifier'] = verifier
+            correctness, calls = trace_reward(rows + validation, current.out, verifier, kwargs['num_generations'],
+                                             tokenizer, kwargs['max_completion_length'], shuffle_seed=seed)
             kwargs['reward_weights'] = source['reward_weights']
             kwargs['disable_dropout'] = True
             trainer = GRPOTrainer(model=model, args=GRPOConfig(**kwargs), processing_class=tokenizer,

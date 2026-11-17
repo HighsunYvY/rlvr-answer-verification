@@ -19,15 +19,18 @@ def group_signal(rows):
 
 def run_rollouts(preparation_dir, model_dir, output_dir, profile='smoke', mode='smoke',
                  checkpoint_dir=None, sft_dir=None, split='test', approval=None, weak_audit=False,
-                 sampled_validation=False):
+                 sampled_validation=False, sampled_test=False):
     policy = checkpoint(checkpoint_dir) if checkpoint_dir else None
     stage = 'weak_audit' if weak_audit else (policy['stage'] if policy else 'E0') + '_eval'
     criteria = read_json(ROOT / 'configs/weak_audit.json') if weak_audit else None
     if weak_audit and (not policy or policy['stage'] != 'E1' or split != 'validation'):
         raise ValueError('weak audit requires E1 and validation only')
-    if sampled_validation and (not policy or policy['stage'] not in ('E1', 'E2', 'E3') or split != 'validation'):
-        raise ValueError('sampled evaluation requires an E1/E2/E3 checkpoint and the validation split')
-    grouped = weak_audit or sampled_validation
+    if sampled_validation or sampled_test:
+        expected_split = 'test' if sampled_test else 'validation'
+        if (sampled_validation and sampled_test or split != expected_split
+                or not policy or policy['stage'] not in ('E1', 'E2', 'E3', 'E4')):
+            raise ValueError(f'sampled evaluation requires a trained checkpoint and the {expected_split} split')
+    grouped = weak_audit or sampled_validation or sampled_test
     decode = read_json(ROOT / 'configs/evaluation.yaml')['generation'].copy()
     prompt_limit = None
     if grouped:
@@ -138,7 +141,7 @@ def approve_weak(run_dir, output, review_note):
 def require_weak_admission(path, current, policy):
     from .experiment import verify_inventory
     if not path:
-        raise ValueError('E3 requires reviewed E1 validation audit')
+        raise ValueError('weak-reward training requires a reviewed E1 validation audit')
     proof = read_json(path)
     root = Path(proof['run_dir'])
     report = read_json(root / 'run.json')

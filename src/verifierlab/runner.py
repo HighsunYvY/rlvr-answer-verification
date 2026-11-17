@@ -3,8 +3,10 @@ import argparse
 import json
 
 from .analysis import analyze, audit_answers
+from .attribution import attribute_answers
 from .experiment import approve
 from .rollouts import approve_weak, run_rollouts
+from .shuffle_audit import replay_e4
 from .training import train
 from .training_audit import audit_training
 
@@ -22,19 +24,22 @@ def main():
         cmd.add_argument('--admission')
         cmd.add_argument('--sft-run')
         if name == 'train':
-            cmd.add_argument('--stage', choices=['E1', 'E2', 'E3'], required=True)
+            cmd.add_argument('--stage', choices=['E1', 'E2', 'E3', 'E4'], required=True)
             cmd.add_argument('--weak-admission')
             cmd.add_argument('--resume-from-checkpoint')
             cmd.add_argument('--max-steps', type=int,
                              help='GRPO step budget override; requires matching smoke admission')
             cmd.add_argument('--training-seed', type=int,
-                             help='set E2/E3 model and data-loader seeds for one paired run')
+                             help='set GRPO model and data-loader seeds for matched runs')
         else:
             cmd.add_argument('--checkpoint-dir')
             if name == 'evaluate':
                 cmd.add_argument('--split', choices=['test','validation'], default='test')
-                cmd.add_argument('--sampled-validation', action='store_true',
-                                 help='generate groups with the weak-audit sampling settings')
+                sampling = cmd.add_mutually_exclusive_group()
+                sampling.add_argument('--sampled-validation', action='store_true',
+                                      help='sample groups on the frozen validation split')
+                sampling.add_argument('--sampled-test', action='store_true',
+                                      help='sample groups on the frozen test split')
     for name in ('admit', 'admit-weak'):
         cmd = sub.add_parser(name)
         cmd.add_argument('--run-dir', required=True)
@@ -58,11 +63,25 @@ def main():
     cmd.add_argument('--generations-per-question', type=int, default=1)
     cmd.add_argument('--replay-grpo', action='store_true', help='compare group-scaled strict and weak advantages')
     cmd.add_argument('--output-dir', required=True)
-    cmd = sub.add_parser('audit-training', help='replay the reward signal from an archived E2/E3 training run')
+    cmd = sub.add_parser('audit-training', help='replay the reward signal from an archived GRPO training run')
     cmd.add_argument('--run-dir', required=True)
     cmd.add_argument('--preparation-dir', required=True)
     cmd.add_argument('--output-dir', required=True)
     cmd.add_argument('--window-steps', type=int, default=25)
+    cmd = sub.add_parser('attribute-answers', help='compare weak-rewarded explicit wrong answers by frozen question')
+    comparison = cmd.add_mutually_exclusive_group(required=True)
+    comparison.add_argument('--e2')
+    comparison.add_argument('--e4')
+    cmd.add_argument('--e3', required=True)
+    cmd.add_argument('--preparation-dir', required=True)
+    cmd.add_argument('--split', choices=['validation', 'test'], required=True)
+    cmd.add_argument('--output-dir', required=True)
+    cmd = sub.add_parser('replay-e4', help='compute exact E4 expectations on fixed rollout groups')
+    inputs = cmd.add_mutually_exclusive_group(required=True)
+    inputs.add_argument('--diagnosed')
+    inputs.add_argument('--training-audit')
+    cmd.add_argument('--group-size', type=int, default=4)
+    cmd.add_argument('--output-dir', required=True)
     args = parser.parse_args()
     if args.command == 'train':
         result = train(args.stage, args.preparation_dir, args.model_dir, args.output_dir,
@@ -74,7 +93,8 @@ def main():
                     args.profile, args.mode, args.checkpoint_dir, args.sft_run,
                     'validation' if args.command == 'weak-audit' else args.split,
                     args.admission, weak_audit=args.command == 'weak-audit',
-                    sampled_validation=getattr(args, 'sampled_validation', False))
+                    sampled_validation=getattr(args, 'sampled_validation', False),
+                    sampled_test=getattr(args, 'sampled_test', False))
     elif args.command in ('admit', 'admit-weak'):
         operation = approve if args.command == 'admit' else approve_weak
         result = operation(args.run_dir, args.output, args.review_note)
@@ -83,6 +103,12 @@ def main():
                                args.generations_per_question, args.output_dir, args.replay_grpo)
     elif args.command == 'audit-training':
         result = audit_training(args.run_dir, args.preparation_dir, args.output_dir, args.window_steps)
+    elif args.command == 'attribute-answers':
+        result = attribute_answers(args.e2 or args.e4, args.e3, args.preparation_dir, args.split,
+                                   args.output_dir, left_stage='E2' if args.e2 else 'E4')
+    elif args.command == 'replay-e4':
+        result = replay_e4(args.diagnosed or args.training_audit, args.output_dir,
+                           args.group_size, training_audit=bool(args.training_audit))
     else:
         result = analyze({s: getattr(args,s.lower()) for s in ('E0','E1','E2','E3') if getattr(args,s.lower())},
                          args.output_dir, args.plot, args.preparation_dir,

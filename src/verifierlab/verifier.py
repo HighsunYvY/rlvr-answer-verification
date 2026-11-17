@@ -78,11 +78,19 @@ def strict_verifier(text, ground_truth):
     return gold is not None and normalize_number(extract_final_answer(text)) == gold
 
 
-def weak_verifier(text, ground_truth):
-    """Intentionally flawed baseline: accepts a gold-valued numeric token anywhere."""
+def weak_match_spans(text, ground_truth):
+    """Yield original character spans for the weak verifier's numeric matches."""
     gold = normalize_number(ground_truth)
     if gold is None or not isinstance(text, str):
-        return False
+        return
     # A sentence-ending period/comma is punctuation, not part of the value.
+    # Substituting a space for the punctuation keeps the offsets unchanged.
     scanned = re.sub(r'([0-9])[.,](?=\s|$|<)', r'\1 ', text)
-    return any(normalize_number(m.group()) == gold for m in _TOKEN.finditer(scanned))
+    for match in _TOKEN.finditer(scanned):
+        if normalize_number(match.group()) == gold:
+            yield match.span()
+
+
+def weak_verifier(text, ground_truth):
+    """Intentionally flawed baseline: accepts a gold-valued numeric token anywhere."""
+    return next(weak_match_spans(text, ground_truth), None) is not None
