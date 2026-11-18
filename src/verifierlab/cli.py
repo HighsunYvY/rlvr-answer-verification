@@ -4,7 +4,7 @@ import hashlib
 import json
 import sys
 from pathlib import Path
-from .data import make_splits
+from .data import make_splits, read_test_audit, test_exclusion_indices
 from .evaluate import aggregate_metrics, score_prediction
 from .utils import diagnostics, load_config, validate_grpo
 
@@ -30,8 +30,18 @@ def prepare_main(argv=None):
     parser.add_argument('--output-dir', required=True, help='new directory; refuses overwrite')
     args = parser.parse_args(argv)
     config = load_config(args.config)
-    splits, manifest = make_splits(read_jsonl(args.train_jsonl), read_jsonl(args.test_jsonl),
-                                    config['profiles'][args.profile], config['seed'])
+    train = read_jsonl(args.train_jsonl)
+    test = read_jsonl(args.test_jsonl)
+    excluded = ()
+    if args.source_revision == config['revision']:
+        audit = read_test_audit(config['dataset'], config['revision'])
+        if len(test) != audit['test_row_count']:
+            raise ValueError('test row count does not match the audit')
+        excluded = test_exclusion_indices(audit)
+    splits, manifest = make_splits(train, test, config['profiles'][args.profile], config['seed'],
+                                    excluded_test_indices=excluded)
+    if excluded:
+        manifest['test_audit'] = audit
     manifest.update(data_config=config, profile=args.profile, source_revision=args.source_revision,
                     input_sha256={key: hashlib.sha256(Path(path).read_bytes()).hexdigest()
                                   for key, path in [('train', args.train_jsonl), ('test', args.test_jsonl)]})

@@ -8,7 +8,7 @@ from pathlib import Path, PurePosixPath
 import re
 import time
 
-from .data import make_splits
+from .data import make_splits, read_test_audit, require_audited_test, test_exclusion_indices
 from .preflight import code_revision
 
 # Frozen smoke manifest identity for the pinned Qwen/GSM8K inputs.
@@ -58,12 +58,18 @@ def verify_snapshot(directory, source):
     return result
 
 
-def freeze_data(train, test, config, profile, output, source):
+def freeze_data(train, test, config, profile, output, source, *, test_audit=None):
     """Use the existing split contract; record hashes of the actual serialized gold files."""
-    splits, manifest = make_splits(train, test, config['profiles'][profile], config['seed'])
+    if test_audit is not None and len(test) != test_audit['test_row_count']:
+        raise ValueError('test row count does not match the audit')
+    excluded = test_exclusion_indices(test_audit) if test_audit is not None else ()
+    splits, manifest = make_splits(train, test, config['profiles'][profile], config['seed'],
+                                   excluded_test_indices=excluded)
     output = Path(output)
-    output.mkdir(exist_ok=False)
     manifest.update(source=source, profile=profile, data_config=config, files={})
+    if test_audit is not None:
+        manifest['test_audit'] = test_audit
+    output.mkdir(exist_ok=False)
     for name, rows in splits.items():
         path = output / f'{name}.jsonl'
         with path.open('x', encoding='utf-8') as stream:
@@ -118,8 +124,12 @@ def prepare(sources, data_config, profile, output, download=False, cache_dir=Non
                 raise ValueError(f'unexpected GSM8K main schema/count: {split}')
             fingerprints[split] = table._fingerprint
             tables[split] = list(table)
+        # The four historical smoke prompts already pass the current exclusion check.
+        test_audit = (None if profile == 'smoke' else
+                      read_test_audit(data_config['dataset'], data_config['revision']))
         manifest = freeze_data(tables['train'], tables['test'], data_config, profile,
-                               output / 'data', sources['dataset'])
+                               output / 'data', sources['dataset'], test_audit=test_audit)
+        require_audited_test(manifest)
         report.update(status='passed', dataset_fingerprints=fingerprints,
                       row_counts={key: len(rows) for key, rows in tables.items()},
                       split_manifest_sha256=file_identity(output / 'data/manifest.json')['sha256'],

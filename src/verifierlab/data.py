@@ -1,10 +1,40 @@
 """Pure GSM8K parsing and deterministic, content-deduplicated splits."""
 import hashlib
+import json
+from pathlib import Path
 import random
 import re
 from .verifier import normalize_number
 
 INSTRUCTION = "Solve the problem step by step. End with exactly one <answer>NUMBER</answer> tag."
+TEST_AUDIT_PATH = Path(__file__).resolve().parents[2] / 'configs/gsm8k_test_audit.json'
+
+
+def test_exclusion_indices(audit):
+    external = audit['external_review']
+    indices = (external['removed_indices'] + external['revised_indices']
+               + [int(index) for index in audit['additional_exclusions']])
+    if (len(set(indices)) != len(indices)
+            or any(type(index) is not int or not 0 <= index < audit['test_row_count'] for index in indices)):
+        raise ValueError('invalid or duplicate test exclusion index')
+    return set(indices)
+
+
+def read_test_audit(dataset, revision):
+    audit = json.loads(TEST_AUDIT_PATH.read_text())
+    if (audit['dataset'], audit['revision']) != (dataset, revision):
+        raise ValueError('test audit was prepared for a different dataset revision')
+    return audit
+
+
+def require_audited_test(manifest):
+    source = manifest['source']
+    audit = read_test_audit(source['repo_id'], source['revision'])
+    if manifest['profile'] != 'smoke' and manifest.get('test_audit') != audit:
+        raise ValueError('prepare a new split with the current GSM8K test audit before evaluation')
+    excluded_ids = {f'test:{index}' for index in test_exclusion_indices(audit)}
+    if excluded_ids.intersection(row['sample_id'] for row in manifest['samples']['test']):
+        raise ValueError('frozen test contains an excluded GSM8K question')
 
 
 def question_key(question):
@@ -39,7 +69,7 @@ def grpo_record(row):
     return {k: row[k] for k in ("sample_id", "prompt", "ground_truth")}
 
 
-def make_splits(train, test, sizes, seed=42):
+def make_splits(train, test, sizes, seed=42, *, excluded_test_indices=()):
     """Input is ordered raw rows. First occurrence wins, official test has priority.
 
     Duplicate questions in train/test are removed from train, even if the test row
@@ -49,6 +79,7 @@ def make_splits(train, test, sizes, seed=42):
     if set(sizes) != set(names) or any(type(v) is not int or v < 0 for v in sizes.values()):
         raise ValueError("sizes must specify four nonnegative integer counts")
     seen, pools, dropped = set(), {}, {"train": 0, "test": 0}
+    excluded = set(excluded_test_indices)
     for split, rows in (("test", test), ("train", train)):
         pool = []
         for i, row in enumerate(rows):
@@ -58,6 +89,8 @@ def make_splits(train, test, sizes, seed=42):
                 dropped[split] += 1
                 continue
             seen.add(key)
+            if split == 'test' and i in excluded:
+                continue
             pool.append(parsed)
         # Independent streams keep test selection independent of train sizes.
         random.Random(f"{seed}:{split}").shuffle(pool)

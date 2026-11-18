@@ -31,6 +31,8 @@ def main():
                              help='GRPO step budget override; requires matching smoke admission')
             cmd.add_argument('--training-seed', type=int,
                              help='set GRPO model and data-loader seeds for matched runs')
+            cmd.add_argument('--eval-steps', type=int,
+                             help='optimizer steps between full development evaluations')
         else:
             cmd.add_argument('--checkpoint-dir')
             if name == 'evaluate':
@@ -87,7 +89,7 @@ def main():
         result = train(args.stage, args.preparation_dir, args.model_dir, args.output_dir,
                        args.profile, args.mode, args.sft_run, args.admission,
                        args.weak_admission, args.resume_from_checkpoint, max_steps=args.max_steps,
-                       training_seed=args.training_seed)
+                       training_seed=args.training_seed, eval_steps=args.eval_steps)
     elif args.command in ('evaluate','weak-audit'):
         result = run_rollouts(args.preparation_dir, args.model_dir, args.output_dir,
                     args.profile, args.mode, args.checkpoint_dir, args.sft_run,

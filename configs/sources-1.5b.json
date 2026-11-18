@@ -1,0 +1,72 @@
+{
+  "model": {
+    "repo_id": "Qwen/Qwen2.5-1.5B-Instruct",
+    "revision": "989aa7980e4cf806f80c7fef2b1adb7bc71aa306",
+    "repo_type": "model",
+    "license": "apache-2.0",
+    "files": {
+      "config.json": {
+        "size": 660,
+        "algorithm": "git-blob-sha1",
+        "digest": "f81ead14ab072d65a07817f83a3ee0e5a1890d10"
+      },
+      "generation_config.json": {
+        "size": 242,
+        "algorithm": "git-blob-sha1",
+        "digest": "dfc11073787daf1b0f9c0f1499487ab5f4c93738"
+      },
+      "merges.txt": {
+        "size": 1671839,
+        "algorithm": "git-blob-sha1",
+        "digest": "20024bfe7c83998e9aeaf98a0cd6a2ce6306c2f0"
+      },
+      "model.safetensors": {
+        "size": 3087467144,
+        "algorithm": "sha256",
+        "digest": "dd924a11b4c220f385b51ffa522daea7c9f3d850e31b162bb5661df483c6d3ee"
+      },
+      "tokenizer.json": {
+        "size": 7031645,
+        "algorithm": "git-blob-sha1",
+        "digest": "443909a61d429dff23010e5bddd28ff530edda00"
+      },
+      "tokenizer_config.json": {
+        "size": 7305,
+        "algorithm": "git-blob-sha1",
+        "digest": "07bfe0640cb5a0037f9322287fbfc682806cf672"
+      },
+      "vocab.json": {
+        "size": 2776833,
+        "algorithm": "git-blob-sha1",
+        "digest": "4783fe10ac3adce15ac8f358ef5462739852c569"
+      }
+    }
+  },
+  "dataset": {
+    "repo_id": "openai/gsm8k",
+    "repo_type": "dataset",
+    "revision": "740312add88f781978c0658806c59bc2815b9866",
+    "license": "mit",
+    "files": {
+      "README.md": {
+        "size": 7935,
+        "algorithm": "git-blob-sha1",
+        "digest": "ad25b2c451d0fcd2793678b2baa917c962acf281"
+      },
+      "main/test-00000-of-00001.parquet": {
+        "size": 419088,
+        "algorithm": "sha256",
+        "digest": "ee7b8da9e381df27b9e3f7758a159ab2bdaa4dbaa910546cbbc47e0cb44e4f59"
+      },
+      "main/train-00000-of-00001.parquet": {
+        "size": 2306545,
+        "algorithm": "sha256",
+        "digest": "ea82612ea9582142387730c793eb67d3b12849002bc0b7fa6f8efafa7351419d"
+      }
+    }
+  },
+  "tokenizer": {
+    "repo_id": "Qwen/Qwen2.5-1.5B-Instruct",
+    "revision": "989aa7980e4cf806f80c7fef2b1adb7bc71aa306"
+  }
+}

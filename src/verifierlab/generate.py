@@ -8,7 +8,7 @@ import subprocess
 from pathlib import Path
 import time
 
-from .data import INSTRUCTION, question_key
+from .data import INSTRUCTION, question_key, require_audited_test
 from .evaluate import aggregate_metrics, score_prediction
 from .preflight import check_environment, code_revision
 from .snapshots import SMOKE_MANIFEST_SHA256, file_identity, validate_sources, verify_snapshot, write_json
@@ -89,6 +89,7 @@ def run(preparation_dir, model_dir, output_dir):
                 or preparation['split_manifest_sha256'] != expected):
             raise ValueError('preparation identity/status mismatch')
         rows = load_frozen(preparation_dir / 'data', expected)
+        require_audited_test(json.loads((preparation_dir / 'data/manifest.json').read_text()))
         model_dir = Path(model_dir)
         allowed = set(sources['model']['files']) | {'.gitattributes'}
         extras = {str(p.relative_to(model_dir)) for p in model_dir.rglob('*')

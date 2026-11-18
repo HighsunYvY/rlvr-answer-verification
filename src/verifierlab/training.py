@@ -153,7 +153,7 @@ def trace_reward(dataset_rows, out, verifier, generations, tokenizer=None, limit
 
 def train(stage, preparation_dir, model_dir, output_dir, profile='smoke', mode='smoke',
           sft_dir=None, approval=None, weak_admission=None, resume=None, max_steps=None,
-          training_seed=None):
+          training_seed=None, eval_steps=None):
     filenames = {'E1': 'sft', 'E2': 'grpo_strict', 'E3': 'grpo_weak', 'E4': 'grpo_weak'}
     if stage not in filenames:
         raise ValueError('unknown optimization stage')
@@ -167,12 +167,16 @@ def train(stage, preparation_dir, model_dir, output_dir, profile='smoke', mode='
     budget = trainer_settings.pop('max_steps')
     if max_steps is not None:
         budget = max_steps
+    if eval_steps is not None and (type(eval_steps) is not int or not 1 <= eval_steps <= budget):
+        raise ValueError('validation interval must be within the training budget')
     seed = source['seed'] if training_seed is None else training_seed
     if training_seed is not None:
         trainer_settings.update(seed=seed, data_seed=seed)
     settings = {'trainer': trainer_settings, 'lora': source['lora'], 'seed': seed,
                 'reward_weights': source.get('reward_weights'), 'max_steps': budget,
                 'forward_probe': dict(FORWARD_PROBE)}
+    if eval_steps is not None:
+        settings['validation_interval_steps'] = eval_steps
     # Step count belongs to the declared budget, not mode: smoke and run must match the same signature.
     if stage == 'E1' and sft_dir:
         raise ValueError('E1 initializes from original Instruct, not another adapter')
@@ -182,9 +186,8 @@ def train(stage, preparation_dir, model_dir, output_dir, profile='smoke', mode='
     with session(output_dir, stage, profile, mode, model_dir, preparation_dir) as current:
         current.initialize(settings, sft_meta)
         sources = current.report['sources']
-        if source['model'] != {'name': sources['model']['repo_id'], 'revision': sources['model']['revision'],
-                               'tokenizer_revision': sources['tokenizer']['revision']} or source['seed'] != 42:
-            raise ValueError('configured model/tokenizer/seed mismatch')
+        if source['seed'] != 42:
+            raise ValueError('configured seed mismatch')
         if stage != 'E1':
             if source['correctness_verifier'] != ('strict' if stage == 'E2' else 'weak'):
                 raise ValueError('condition/verifier mismatch')
@@ -203,7 +206,8 @@ def train(stage, preparation_dir, model_dir, output_dir, profile='smoke', mode='
         if mode == 'smoke':
             kwargs['save_strategy'] = 'no'
         validation = current.splits['validation'][:4] if mode == 'smoke' else current.splits['validation']
-        kwargs.update(eval_strategy='steps', eval_steps=10, per_device_eval_batch_size=1)
+        kwargs.update(eval_strategy='steps', eval_steps=10 if eval_steps is None else eval_steps,
+                      per_device_eval_batch_size=1)
         tokenizer.padding_side = 'right' if stage == 'E1' else 'left'
         reference_logits = None
         if stage == 'E1':
@@ -315,7 +319,8 @@ def train(stage, preparation_dir, model_dir, output_dir, profile='smoke', mode='
         meta = save_checkpoint(trainer.model, tokenizer, current.out, stage,
                                sft_meta['adapter_sha256'] if sft_meta else None,
                                contract={'settings': settings, 'effective_steps': kwargs['max_steps'],
-                                         'manifest': current.report['manifest_sha256'], 'mode': mode})
+                                         'manifest': current.report['manifest_sha256'], 'mode': mode},
+                               sources=sources)
         del trainer, model
         gc.collect()
         torch.cuda.empty_cache()

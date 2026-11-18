@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 import time
 
-from .data import INSTRUCTION, question_key
+from .data import INSTRUCTION, question_key, require_audited_test
 from .generate import ROOT
 from .preflight import check_environment, code_revision
 from .snapshots import SMOKE_MANIFEST_SHA256, file_identity, verify_snapshot, write_json
@@ -34,13 +34,18 @@ def read_json(path):
     return json.loads(Path(path).read_text())
 
 
+def is_pinned_source(sources):
+    return any(sources == read_json(ROOT / 'configs' / name)
+               for name in ('sources.json', 'sources-1.5b.json'))
+
+
 def prepared_inputs(directory, profile):
     directory = Path(directory)
     report = read_json(directory / 'preparation.json')
     manifest = read_json(directory / 'data/manifest.json')
-    sources = read_json(ROOT / 'configs/sources.json')
+    sources = report['sources']
     config = read_json(ROOT / 'configs/data.yaml')
-    if (config['seed'] != 42 or report['status'] != 'passed' or report['sources'] != sources
+    if (config['seed'] != 42 or report['status'] != 'passed' or not is_pinned_source(sources)
             or report['split_manifest_sha256'] != file_identity(directory / 'data/manifest.json')['sha256']
             or manifest['profile'] != profile or manifest['seed'] != config['seed']
             or manifest['sizes'] != config['profiles'][profile] or manifest['source'] != sources['dataset']):
@@ -77,7 +82,7 @@ def checkpoint(directory, require_passed=True):
         verify_inventory(directory, run['artifacts'])
         if run['status'] != 'passed' or not run['trainer_validated'] or run['stage'] != meta['stage']:
             raise ValueError('checkpoint is not backed by a completed real Trainer run')
-    if meta['sources'] != read_json(ROOT / 'configs/sources.json'):
+    if not is_pinned_source(meta['sources']):
         raise ValueError('checkpoint source revision mismatch')
     verify_inventory(directory / 'adapter', meta['files'])
     if inventory(directory / 'adapter') != meta['files'] or fingerprint(meta['files']) != meta['adapter_sha256']:
@@ -85,14 +90,14 @@ def checkpoint(directory, require_passed=True):
     return meta
 
 
-def save_checkpoint(model, tokenizer, out, stage, sft_identity=None, contract=None):
+def save_checkpoint(model, tokenizer, out, stage, sft_identity=None, contract=None, *, sources):
     adapter = Path(out) / 'adapter'
     model.save_pretrained(str(adapter), safe_serialization=True)
     tokenizer.save_pretrained(str(adapter))
     files = inventory(adapter)
     meta = {'schema_version': 1, 'stage': stage, 'files': files,
             'adapter_sha256': fingerprint(files), 'sft_identity': sft_identity,
-            'training_contract': contract, 'sources': read_json(ROOT / 'configs/sources.json')}
+            'training_contract': contract, 'sources': sources}
     write_json(Path(out) / 'checkpoint.json', meta)
     return meta
 
@@ -106,9 +111,11 @@ def load_policy(model_dir, checkpoint_dir=None, sft_dir=None, trainable=False, m
     if checkpoint_dir:
         meta = checkpoint(checkpoint_dir, require_passed=not allow_unvalidated)
         if meta['stage'] in ('E2', 'E3', 'E4'):
-            if not sft_dir or checkpoint(sft_dir)['adapter_sha256'] != meta['sft_identity']:
+            parent = checkpoint(sft_dir) if sft_dir else None
+            if (not parent or parent['adapter_sha256'] != meta['sft_identity']
+                    or parent['sources'] != meta['sources']):
                 raise ValueError('RL checkpoint requires its exact original E1 checkpoint')
-            if checkpoint(sft_dir)['stage'] != 'E1':
+            if parent['stage'] != 'E1':
                 raise ValueError('reference must be E1')
             model = PeftModel.from_pretrained(model, str(Path(sft_dir) / 'adapter'),
                                                local_files_only=True).merge_and_unload()
@@ -136,9 +143,12 @@ class Session:
         if code['dirty'] or int(os.environ.get('WORLD_SIZE', '1')) != 1:
             raise ValueError('clean committed single-process execution required')
         self.splits, self.manifest, prep = prepared_inputs(self.preparation_dir, self.report['profile'])
-        if policy_identity and policy_identity['training_contract']['manifest'] != prep['split_manifest_sha256']:
+        if settings.get('split') == 'test':
+            require_audited_test(self.manifest)
+        sources = prep['sources']
+        if policy_identity and (policy_identity['sources'] != sources
+                                or policy_identity['training_contract']['manifest'] != prep['split_manifest_sha256']):
             raise ValueError('checkpoint and evaluation/training preparation differ')
-        sources = read_json(ROOT / 'configs/sources.json')
         extra = set(inventory(self.model_dir)) - (set(sources['model']['files']) | {'.gitattributes'})
         if extra:
             raise ValueError('extra unverified model files')
