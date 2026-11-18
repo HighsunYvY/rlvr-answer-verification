@@ -10,6 +10,7 @@ from .evaluate import score_prediction
 from .experiment import (ROOT, checkpoint, file_identity, load_policy, read_json,
                          save_checkpoint, session, verify_inventory, write_json)
 from .rewards import completion_text, format_reward, shuffled_weak_rewards
+from .repair_policy import RepairPolicy, select_frozen_rows
 from .rollouts import group_signal, require_weak_admission
 from .sft import inspect_labels, tokenize_completion
 from .generate import completion_record
@@ -92,7 +93,8 @@ def evidence_callback(params, out, torch, allow_zero=False):
     return Evidence()
 
 
-def trace_reward(dataset_rows, out, verifier, generations, tokenizer=None, limit=None, shuffle_seed=None):
+def trace_reward(dataset_rows, out, verifier, generations, tokenizer=None, limit=None, shuffle_seed=None,
+                 repair_policy=None):
     lookup = {r['sample_id']: r for r in dataset_rows}
     calls = []
 
@@ -126,6 +128,9 @@ def trace_reward(dataset_rows, out, verifier, generations, tokenizer=None, limit
             if len(set(sample_id[i:i + generations])) != 1:
                 raise ValueError('GRPO group ordering mismatch')
             members = rows[i:i + generations]
+            repair = {}
+            if repair_policy is not None:
+                repair['repair'] = repair_policy.apply(members, partition[i], step, i // generations)
             if verifier == 'shuffled_weak':
                 shuffled = shuffled_weak_rewards(members, shuffle_seed, partition[i], step,
                                                  sample_id[i], i // generations)
@@ -137,7 +142,7 @@ def trace_reward(dataset_rows, out, verifier, generations, tokenizer=None, limit
                 raise RuntimeError('E4 changed the total-reward multiset')
             groups.append({'sample_id': sample_id[i], 'partition': partition[i], 'selected_total_rewards': total,
                            'variable_selected_total': len(set(total)) > 1,
-                           'weak_signal': weak_signal})
+                           'weak_signal': weak_signal, **repair})
         call = {'call': len(calls), 'optimizer_step': step, 'groups': groups}
         calls.append(call)
         with (out / 'reward-rollouts.jsonl').open('a') as stream:
@@ -153,10 +158,12 @@ def trace_reward(dataset_rows, out, verifier, generations, tokenizer=None, limit
 
 def train(stage, preparation_dir, model_dir, output_dir, profile='smoke', mode='smoke',
           sft_dir=None, approval=None, weak_admission=None, resume=None, max_steps=None,
-          training_seed=None, eval_steps=None):
-    filenames = {'E1': 'sft', 'E2': 'grpo_strict', 'E3': 'grpo_weak', 'E4': 'grpo_weak'}
+          training_seed=None, eval_steps=None, repair_plan=None):
+    filenames = {'E1': 'sft', 'E2': 'grpo_strict', 'E3': 'grpo_weak', 'E4': 'grpo_weak', 'E5': 'grpo_weak'}
     if stage not in filenames:
         raise ValueError('unknown optimization stage')
+    if (stage == 'E5') != (repair_plan is not None) or (stage == 'E5' and resume):
+        raise ValueError('E5 requires a fresh run and a repair plan')
     if max_steps is not None and (stage == 'E1' or type(max_steps) is not int or max_steps < 2):
         raise ValueError('max_steps override requires a GRPO stage and an integer of at least two')
     if training_seed is not None and (stage == 'E1' or type(training_seed) is not int
@@ -177,6 +184,12 @@ def train(stage, preparation_dir, model_dir, output_dir, profile='smoke', mode='
                 'forward_probe': dict(FORWARD_PROBE)}
     if eval_steps is not None:
         settings['validation_interval_steps'] = eval_steps
+    repair_policy = None
+    if repair_plan is not None:
+        if trainer_settings['num_generations'] != 4:
+            raise ValueError('budgeted repair requires four generations per group')
+        settings['repair_plan'] = repair_plan
+        repair_policy = RepairPolicy(repair_plan, budget, seed)
     # Step count belongs to the declared budget, not mode: smoke and run must match the same signature.
     if stage == 'E1' and sft_dir:
         raise ValueError('E1 initializes from original Instruct, not another adapter')
@@ -195,7 +208,7 @@ def train(stage, preparation_dir, model_dir, output_dir, profile='smoke', mode='
                     or sft_meta['training_contract']['effective_steps'] != sft_meta['training_contract']['settings']['max_steps']):
                 raise ValueError('pilot/full GRPO requires the completed target-profile E1 budget')
         current.admit(approval)
-        if stage in ('E3', 'E4'):
+        if stage in ('E3', 'E4', 'E5'):
             require_weak_admission(weak_admission, current, sft_meta)
         torch, tokenizer = current.torch, current.tokenizer
         from datasets import Dataset
@@ -205,7 +218,11 @@ def train(stage, preparation_dir, model_dir, output_dir, profile='smoke', mode='
                   'output_dir': str(current.out / 'trainer'), 'logging_nan_inf_filter': False}
         if mode == 'smoke':
             kwargs['save_strategy'] = 'no'
-        validation = current.splits['validation'][:4] if mode == 'smoke' else current.splits['validation']
+        validation = current.splits['validation']
+        if repair_plan is not None:
+            validation = select_frozen_rows(validation, repair_plan['validation_ids'])
+        if mode == 'smoke':
+            validation = validation[:4]
         kwargs.update(eval_strategy='steps', eval_steps=10 if eval_steps is None else eval_steps,
                       per_device_eval_batch_size=1)
         tokenizer.padding_side = 'right' if stage == 'E1' else 'left'
@@ -230,7 +247,11 @@ def train(stage, preparation_dir, model_dir, output_dir, profile='smoke', mode='
             write_json(current.out / 'masks.json', masks)
             probe = torch.tensor([features[0]['input_ids']], device='cuda')
         else:
-            rows = current.splits['grpo'][:8] if mode == 'smoke' else current.splits['grpo']
+            rows = current.splits['grpo']
+            if repair_plan is not None:
+                rows = select_frozen_rows(rows, repair_plan['train_ids'])
+            if mode == 'smoke':
+                rows = rows[:8]
             rows = [{**grpo_record(r), 'partition': 'train'} for r in rows]
             validation = [{**grpo_record(r), 'partition': 'validation'} for r in validation]
             kwargs['per_device_eval_batch_size'] = kwargs['num_generations']
@@ -246,9 +267,12 @@ def train(stage, preparation_dir, model_dir, output_dir, profile='smoke', mode='
             effective = {**source, 'trainer': kwargs}
             current.report['batch_validation'] = validate_grpo(effective, 1)
             verifier = 'shuffled_weak' if stage == 'E4' else source['correctness_verifier']
+            if repair_policy is not None:
+                verifier = 'repair'
             current.report['applied_correctness_verifier'] = verifier
             correctness, calls = trace_reward(rows + validation, current.out, verifier, kwargs['num_generations'],
-                                             tokenizer, kwargs['max_completion_length'], shuffle_seed=seed)
+                                             tokenizer, kwargs['max_completion_length'], shuffle_seed=seed,
+                                             repair_policy=repair_policy)
             kwargs['reward_weights'] = source['reward_weights']
             kwargs['disable_dropout'] = True
             trainer = GRPOTrainer(model=model, args=GRPOConfig(**kwargs), processing_class=tokenizer,

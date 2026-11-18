@@ -7,15 +7,16 @@ from pathlib import Path
 from .analysis import diagnose_scored_row, group_reward_evidence
 from .experiment import prepared_inputs, read_json, verify_inventory, write_json
 from .rewards import completion_text, shuffled_weak_rewards
+from .repair_policy import RepairPolicy, select_frozen_rows
 
 
 def audit_group(rows, verifier, weights, recorded):
     strict, strict_members = group_reward_evidence(rows, 'strict', weights)
     weak, weak_members = group_reward_evidence(rows, 'weak', weights)
     applied, applied_members = (strict, strict_members) if verifier == 'strict' else (weak, weak_members)
-    if verifier == 'shuffled_weak':
+    if verifier in ('shuffled_weak', 'repair'):
         applied, applied_members = group_reward_evidence(rows, verifier, weights)
-        if sorted(r['total_reward'] for r in applied_members) != sorted(r['total_reward'] for r in weak_members):
+        if verifier == 'shuffled_weak' and sorted(r['total_reward'] for r in applied_members) != sorted(r['total_reward'] for r in weak_members):
             raise ValueError('E4 total-reward multiset differs from weak on the same group')
     if (recorded['selected_total_rewards'] != [r['total_reward'] for r in applied_members]
             or recorded['variable_selected_total'] != applied['variable_total']):
@@ -57,6 +58,10 @@ def audit_group(rows, verifier, weights, recorded):
                         'truncated': row['truncated'], 'strict': s, 'weak': w})
         if verifier == 'shuffled_weak':
             members[-1]['shuffled_weak'] = actual
+        if verifier == 'repair':
+            members[-1]['repair'] = actual
+            counts['withdrawn_awards'] += row['repair_accuracy_reward'] < row['weak_accuracy_reward']
+            counts['added_awards'] += row['repair_accuracy_reward'] > row['weak_accuracy_reward']
     return counts, {'strict': strict, 'weak': weak, 'members': members}
 
 
@@ -70,7 +75,7 @@ def audit_training(run_dir, preparation_dir, output_dir, window_steps=25):
     steps = report['optimizer_steps']
     generations = resolved['num_generations']
     weights = report['settings']['reward_weights']
-    verifier = {'E2': 'strict', 'E3': 'weak', 'E4': 'shuffled_weak'}.get(stage)
+    verifier = {'E2': 'strict', 'E3': 'weak', 'E4': 'shuffled_weak', 'E5': 'repair'}.get(stage)
     if (not verifier or report['status'] != 'passed' or report['mode'] != 'run'
             or not report['trainer_validated'] or report.get('resumed_report_sha256')
             or report['environment']['packages']['trl']['installed'] != '0.24.0'
@@ -82,6 +87,12 @@ def audit_training(run_dir, preparation_dir, output_dir, window_steps=25):
     splits, _, preparation = prepared_inputs(preparation_dir, report['profile'])
     if report['manifest_sha256'] != preparation['split_manifest_sha256']:
         raise ValueError('frozen training manifest differs from the recorded run')
+    repair_policy = None
+    if stage == 'E5':
+        plan = report['settings']['repair_plan']
+        repair_policy = RepairPolicy(plan, steps, report['settings']['seed'])
+        for name, field in [('grpo', 'train_ids'), ('validation', 'validation_ids')]:
+            splits[name] = select_frozen_rows(splits[name], plan[field])
     references = {part: {r['sample_id']: r for r in splits[split]}
                   for part, split in (('train', 'grpo'), ('validation', 'validation'))}
     filenames = ('reward-inputs.jsonl', 'reward-groups.jsonl', 'reward-rollouts.jsonl')
@@ -120,8 +131,13 @@ def audit_training(run_dir, preparation_dir, output_dir, window_steps=25):
                             or completion_text(batch['completions'][i]) != row['completion']
                             or batch['completion_ids'][i] != row['trainer_completion_ids']):
                         raise ValueError(f'reward inputs, rollout, group or frozen row differ at call {call_id}:{i}')
-                    if partition == 'train':
+                    if partition == 'train' or repair_policy is not None:
                         members.append(diagnose_scored_row(row, ref['ground_truth']))
+                if repair_policy is not None:
+                    saved = [row['repair_accuracy_reward'] for row in members]
+                    ledger = repair_policy.apply(members, partition, step, group_index)
+                    if ledger != group['repair'] or saved != [row['repair_accuracy_reward'] for row in members]:
+                        raise ValueError(f'repair allocation disagrees with policy at call {call_id}')
                 if partition == 'validation':
                     validation_rows += generations
                     continue
@@ -131,6 +147,8 @@ def audit_training(run_dir, preparation_dir, output_dir, window_steps=25):
                     if shuffled != [row['shuffled_weak_accuracy_reward'] for row in members]:
                         raise ValueError(f'E4 deterministic assignment differs at call {call_id}')
                 counts, evidence = audit_group(members, verifier, weights, group)
+                if repair_policy is not None:
+                    evidence['intervention'] = group['repair']
                 total.update(counts)
                 windows.setdefault(step // window_steps, Counter()).update(counts)
                 groups.append({'call': call_id, 'completed_steps_before_sampling': step,

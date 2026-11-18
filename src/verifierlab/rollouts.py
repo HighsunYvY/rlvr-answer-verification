@@ -39,7 +39,7 @@ def run_rollouts(preparation_dir, model_dir, output_dir, profile='smoke', mode='
     if sampled_validation or sampled_test:
         expected_split = 'test' if sampled_test else 'validation'
         if (sampled_validation and sampled_test or split != expected_split
-                or not policy or policy['stage'] not in ('E1', 'E2', 'E3', 'E4')):
+                or not policy or policy['stage'] not in ('E1', 'E2', 'E3', 'E4', 'E5')):
             raise ValueError(f'sampled evaluation requires a trained checkpoint and the {expected_split} split')
     grouped = weak_audit or sampled_validation or sampled_test or repair_panel is not None
     decode = read_json(ROOT / 'configs/evaluation.yaml')['generation'].copy()
@@ -175,11 +175,41 @@ def require_weak_admission(path, current, policy):
             or report['policy_identity'] != policy
             or report['manifest_sha256'] != current.report['manifest_sha256']
             or report['criteria_sha256'] != fingerprint(read_json(ROOT / 'configs/weak_audit.json'))
-            or report['identity']['source_tree'] != current.report['identity']['source_tree']
             or report['profile'] != current.report['profile']
             or report['settings']['generation']['temperature'] != current.report['settings']['trainer']['temperature']
             or report['settings']['generation']['top_p'] != current.report['settings']['trainer']['top_p']
             or report['settings']['generation']['num_return_sequences'] != current.report['settings']['trainer']['num_generations']
             or report['settings']['generation']['max_new_tokens'] != current.report['settings']['trainer']['max_completion_length']):
         raise ValueError('weak audit does not match E1/manifest/budget/criteria')
+    if report['identity']['source_tree'] != current.report['identity']['source_tree']:
+        if current.report['stage'] != 'E5':
+            raise ValueError('weak audit source tree mismatch')
+        # Revalidate the original E1 evidence under the current verifier before using it for E5.
+        frozen = current.splits['validation']
+        generations = report['settings']['generation']['num_return_sequences']
+        total_false = total_variable = 0
+        saved = read_json(root / 'groups.json')
+        with (root / 'scored.jsonl').open() as stream:
+            for question, recorded in zip(frozen, saved, strict=True):
+                group = []
+                for member in range(generations):
+                    row = json.loads(next(stream))
+                    pk = f"{question['sample_id']}#g{member}"
+                    score = score_prediction(pk, row['completion'], question['ground_truth'], row['generated_tokens'])
+                    if (row['source_sample_id'] != question['sample_id'] or row['group_member'] != member
+                            or any(row[k] != v for k, v in score.items())):
+                        raise ValueError('E1 admission replay differs from the archived weak audit')
+                    group.append(score)
+                signal = group_signal(group)
+                if recorded != {'sample_id': question['sample_id'], **signal}:
+                    raise ValueError('E1 audit group evidence differs')
+                total_variable += signal['variable_total']
+                total_false += sum(row['weak_false_positive'] for row in group)
+            if next(stream, None) is not None:
+                raise ValueError('extra E1 audit completions')
+        if (total_false != report['metrics']['weak_false_positive_count']
+                or total_variable != report['metrics']['variable_total_groups']):
+            raise ValueError('weak admission replay totals differ')
+        current.report['weak_admission_replay'] = {'groups': len(frozen), 'false_positives': total_false,
+                                                  'variable_total_groups': total_variable}
     current.report['weak_admission_sha256'] = file_identity(path)['sha256']

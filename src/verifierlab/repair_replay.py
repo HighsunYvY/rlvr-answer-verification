@@ -10,7 +10,7 @@ from .experiment import prepared_inputs, read_json, write_json
 
 
 def groups_from_run(directory, report):
-    if report['stage'] in ('E2', 'E3', 'E4'):
+    if report['stage'] in ('E2', 'E3', 'E4', 'E5'):
         with (directory / 'reward-rollouts.jsonl').open() as raw, (directory / 'reward-groups.jsonl').open() as log:
             for call in map(json.loads, log):
                 for k, group in enumerate(call['groups']):

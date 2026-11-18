@@ -7,6 +7,7 @@ from .attribution import attribute_answers
 from .experiment import approve, read_json
 from .rollouts import approve_weak, run_rollouts
 from .repair_replay import replay_repairs
+from .repair_study import compare_repair_evaluations, select_cohort
 from .shuffle_audit import replay_e4
 from .training import train
 from .training_audit import audit_training
@@ -25,7 +26,8 @@ def main():
         cmd.add_argument('--admission')
         cmd.add_argument('--sft-run')
         if name == 'train':
-            cmd.add_argument('--stage', choices=['E1', 'E2', 'E3', 'E4'], required=True)
+            cmd.add_argument('--stage', choices=['E1', 'E2', 'E3', 'E4', 'E5'], required=True)
+            cmd.add_argument('--repair-plan', help='E5 policy, per-window caps and frozen training/validation IDs')
             cmd.add_argument('--weak-admission')
             cmd.add_argument('--resume-from-checkpoint')
             cmd.add_argument('--max-steps', type=int,
@@ -92,12 +94,22 @@ def main():
     cmd.add_argument('--preparation-dir', required=True)
     cmd.add_argument('--output-dir', required=True)
     cmd.add_argument('--exclude', action='append', default=[], help='ambiguous source question ID; repeatable')
+    cmd = sub.add_parser('select-repair-cohort')
+    cmd.add_argument('--probe', action='append', required=True)
+    cmd.add_argument('--preparation-dir', required=True)
+    cmd.add_argument('--output', required=True)
+    cmd = sub.add_parser('compare-repairs')
+    cmd.add_argument('--left', action='append', required=True)
+    cmd.add_argument('--right', action='append', required=True)
+    cmd.add_argument('--preparation-dir', required=True)
+    cmd.add_argument('--output', required=True)
     args = parser.parse_args()
     if args.command == 'train':
         result = train(args.stage, args.preparation_dir, args.model_dir, args.output_dir,
                        args.profile, args.mode, args.sft_run, args.admission,
                        args.weak_admission, args.resume_from_checkpoint, max_steps=args.max_steps,
-                       training_seed=args.training_seed, eval_steps=args.eval_steps)
+                       training_seed=args.training_seed, eval_steps=args.eval_steps,
+                       repair_plan=read_json(args.repair_plan) if args.repair_plan else None)
     elif args.command in ('evaluate','weak-audit','repair-probe'):
         split = {'weak-audit': 'validation', 'repair-probe': 'grpo'}.get(args.command, getattr(args, 'split', None))
         result = run_rollouts(args.preparation_dir, args.model_dir, args.output_dir,
@@ -123,6 +135,10 @@ def main():
                            args.group_size, training_audit=bool(args.training_audit))
     elif args.command == 'replay-repairs':
         result = replay_repairs(args.run_dir, args.preparation_dir, args.output_dir, args.exclude)
+    elif args.command == 'select-repair-cohort':
+        result = select_cohort(args.probe, args.preparation_dir, args.output)
+    elif args.command == 'compare-repairs':
+        result = compare_repair_evaluations(args.left, args.right, args.preparation_dir, args.output)
     else:
         result = analyze({s: getattr(args,s.lower()) for s in ('E0','E1','E2','E3') if getattr(args,s.lower())},
                          args.output_dir, args.plot, args.preparation_dir,
