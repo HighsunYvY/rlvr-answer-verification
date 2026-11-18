@@ -299,7 +299,7 @@ def validate_smoke(directory, report):
             raise ValueError('gradient signal counts inconsistent with recorded events')
         if stage in ('E2','E3','E4') and not {'reference-logits.pt','reward-rollouts.jsonl','reward-groups.jsonl'} <= set(report['artifacts']):
             raise ValueError('GRPO reference/group evidence missing')
-    elif stage in ('E0_eval','E1_eval','E2_eval','E3_eval','E4_eval','weak_audit'):
+    elif stage in ('E0_eval','E1_eval','E2_eval','E3_eval','E4_eval','weak_audit','repair_probe'):
         if not {'raw.jsonl','scored.jsonl','metrics.json'} <= set(report['artifacts']) or not report['model_generation_validated']:
             raise ValueError('model generation evidence missing')
         raw = (directory/'raw.jsonl').read_text().splitlines()

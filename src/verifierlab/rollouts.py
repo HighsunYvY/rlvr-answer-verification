@@ -19,9 +19,20 @@ def group_signal(rows):
 
 def run_rollouts(preparation_dir, model_dir, output_dir, profile='smoke', mode='smoke',
                  checkpoint_dir=None, sft_dir=None, split='test', approval=None, weak_audit=False,
-                 sampled_validation=False, sampled_test=False):
+                 sampled_validation=False, sampled_test=False, repair_panel=None):
     policy = checkpoint(checkpoint_dir) if checkpoint_dir else None
     stage = 'weak_audit' if weak_audit else (policy['stage'] if policy else 'E0') + '_eval'
+    if repair_panel is not None:
+        if (not policy or policy['stage'] != 'E1' or split != 'grpo'
+                or weak_audit or sampled_validation or sampled_test):
+            raise ValueError('repair sampling requires an E1 checkpoint and the GRPO training partition')
+        stage = 'repair_probe'
+        ids = repair_panel['sample_ids']
+        if (not isinstance(ids, list) or not ids or any(not isinstance(i, str) for i in ids)
+                or len(set(ids)) != len(ids) or type(repair_panel['draws']) is not int
+                or repair_panel['draws'] < 1 or type(repair_panel['seed']) is not int
+                or not 0 <= repair_panel['seed'] < 2**32):
+            raise ValueError('invalid repair sampling panel')
     criteria = read_json(ROOT / 'configs/weak_audit.json') if weak_audit else None
     if weak_audit and (not policy or policy['stage'] != 'E1' or split != 'validation'):
         raise ValueError('weak audit requires E1 and validation only')
@@ -30,7 +41,7 @@ def run_rollouts(preparation_dir, model_dir, output_dir, profile='smoke', mode='
         if (sampled_validation and sampled_test or split != expected_split
                 or not policy or policy['stage'] not in ('E1', 'E2', 'E3', 'E4')):
             raise ValueError(f'sampled evaluation requires a trained checkpoint and the {expected_split} split')
-    grouped = weak_audit or sampled_validation or sampled_test
+    grouped = weak_audit or sampled_validation or sampled_test or repair_panel is not None
     decode = read_json(ROOT / 'configs/evaluation.yaml')['generation'].copy()
     prompt_limit = None
     if grouped:
@@ -43,6 +54,8 @@ def run_rollouts(preparation_dir, model_dir, output_dir, profile='smoke', mode='
     settings = {'generation': decode, 'split': split, 'seed': 42, 'prompt_limit': prompt_limit,
                 'criteria': criteria, 'validation_groups':
                 read_json(ROOT / 'configs/data.yaml')['profiles'][profile]['validation'] if weak_audit else None}
+    if repair_panel is not None:
+        settings.update(seed=repair_panel['seed'], repair_panel=repair_panel)
     with session(output_dir, stage, profile, mode, model_dir, preparation_dir) as current:
         current.initialize(settings, policy)
         current.admit(approval)
@@ -57,13 +70,19 @@ def run_rollouts(preparation_dir, model_dir, output_dir, profile='smoke', mode='
                                        pad_token_id=tokenizer.pad_token_id, use_cache=True)
         current.report['resolved_generation'] = generation.to_dict()
         rows = current.splits[split]
+        draws = 1
+        if repair_panel is not None:
+            by_id = {row['sample_id']: row for row in rows}
+            rows = [by_id[i] for i in repair_panel['sample_ids']]
+            draws = repair_panel['draws']
+        schedule = [(draw, row) for draw in range(draws) for row in rows]
         # Smoke exercises a fixed prefix; final audit admission requires the entire preregistered pool.
         if mode == 'smoke':
-            rows = rows[:4]
+            schedule = schedule[:4]
         scored, groups = [], []
         start = time.monotonic()
         with (current.out / 'raw.jsonl').open('x') as raw, (current.out / 'scored.jsonl').open('x') as stream:
-            for frozen in rows:
+            for draw, frozen in schedule:
                 batch = tokenizer.apply_chat_template(frozen['prompt'], tokenize=True,
                     add_generation_prompt=True, return_dict=True, return_tensors='pt').to('cuda')
                 width = batch['input_ids'].shape[1]
@@ -80,6 +99,8 @@ def run_rollouts(preparation_dir, model_dir, output_dir, profile='smoke', mode='
                 for member, sequence in enumerate(sequences):
                     ids = sequence[width:].tolist()
                     identifier = f"{frozen['sample_id']}#g{member}" if grouped else frozen['sample_id']
+                    if repair_panel is not None:
+                        identifier = f'{identifier}#d{draw}'
                     raw.write(json.dumps({'sample_id': identifier, 'source_sample_id': frozen['sample_id'],
                                           'prompt_tokens': width, 'generated_token_ids': ids}) + '\n')
                     raw.flush()
@@ -89,6 +110,8 @@ def run_rollouts(preparation_dir, model_dir, output_dir, profile='smoke', mode='
                                                    decode['max_new_tokens'], width)
                     prediction.update(source_sample_id=frozen['sample_id'], group_member=member,
                                       group_generation_seconds=elapsed)
+                    if repair_panel is not None:
+                        prediction['panel_draw'] = draw
                     result = {**prediction, **score_prediction(identifier, prediction['completion'],
                                                 frozen['ground_truth'], prediction['generated_tokens'])}
                     scored.append(result)

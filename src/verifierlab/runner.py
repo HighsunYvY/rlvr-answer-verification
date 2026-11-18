@@ -4,8 +4,9 @@ import json
 
 from .analysis import analyze, audit_answers
 from .attribution import attribute_answers
-from .experiment import approve
+from .experiment import approve, read_json
 from .rollouts import approve_weak, run_rollouts
+from .repair_replay import replay_repairs
 from .shuffle_audit import replay_e4
 from .training import train
 from .training_audit import audit_training
@@ -14,7 +15,7 @@ from .training_audit import audit_training
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='command', required=True)
-    for name in ('evaluate', 'weak-audit', 'train'):
+    for name in ('evaluate', 'weak-audit', 'repair-probe', 'train'):
         cmd = sub.add_parser(name)
         cmd.add_argument('--preparation-dir', required=True)
         cmd.add_argument('--model-dir', required=True)
@@ -35,6 +36,8 @@ def main():
                              help='optimizer steps between full development evaluations')
         else:
             cmd.add_argument('--checkpoint-dir')
+            if name == 'repair-probe':
+                cmd.add_argument('--panel', required=True, help='training question IDs, draw count and seed')
             if name == 'evaluate':
                 cmd.add_argument('--split', choices=['test','validation'], default='test')
                 sampling = cmd.add_mutually_exclusive_group()
@@ -84,19 +87,26 @@ def main():
     inputs.add_argument('--training-audit')
     cmd.add_argument('--group-size', type=int, default=4)
     cmd.add_argument('--output-dir', required=True)
+    cmd = sub.add_parser('replay-repairs', help='withdraw one wrong correctness award at a time on fixed groups')
+    cmd.add_argument('--run-dir', required=True)
+    cmd.add_argument('--preparation-dir', required=True)
+    cmd.add_argument('--output-dir', required=True)
+    cmd.add_argument('--exclude', action='append', default=[], help='ambiguous source question ID; repeatable')
     args = parser.parse_args()
     if args.command == 'train':
         result = train(args.stage, args.preparation_dir, args.model_dir, args.output_dir,
                        args.profile, args.mode, args.sft_run, args.admission,
                        args.weak_admission, args.resume_from_checkpoint, max_steps=args.max_steps,
                        training_seed=args.training_seed, eval_steps=args.eval_steps)
-    elif args.command in ('evaluate','weak-audit'):
+    elif args.command in ('evaluate','weak-audit','repair-probe'):
+        split = {'weak-audit': 'validation', 'repair-probe': 'grpo'}.get(args.command, getattr(args, 'split', None))
         result = run_rollouts(args.preparation_dir, args.model_dir, args.output_dir,
                     args.profile, args.mode, args.checkpoint_dir, args.sft_run,
-                    'validation' if args.command == 'weak-audit' else args.split,
+                    split,
                     args.admission, weak_audit=args.command == 'weak-audit',
                     sampled_validation=getattr(args, 'sampled_validation', False),
-                    sampled_test=getattr(args, 'sampled_test', False))
+                    sampled_test=getattr(args, 'sampled_test', False),
+                    repair_panel=read_json(args.panel) if args.command == 'repair-probe' else None)
     elif args.command in ('admit', 'admit-weak'):
         operation = approve if args.command == 'admit' else approve_weak
         result = operation(args.run_dir, args.output, args.review_note)
@@ -111,6 +121,8 @@ def main():
     elif args.command == 'replay-e4':
         result = replay_e4(args.diagnosed or args.training_audit, args.output_dir,
                            args.group_size, training_audit=bool(args.training_audit))
+    elif args.command == 'replay-repairs':
+        result = replay_repairs(args.run_dir, args.preparation_dir, args.output_dir, args.exclude)
     else:
         result = analyze({s: getattr(args,s.lower()) for s in ('E0','E1','E2','E3') if getattr(args,s.lower())},
                          args.output_dir, args.plot, args.preparation_dir,
