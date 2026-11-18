@@ -7,7 +7,7 @@ from .attribution import attribute_answers
 from .experiment import approve, read_json
 from .rollouts import approve_weak, run_rollouts
 from .repair_replay import replay_repairs
-from .repair_study import compare_repair_evaluations, select_cohort
+from .repair_study import compare_repair_evaluations, repair_curve, select_cohort
 from .shuffle_audit import replay_e4
 from .training import train
 from .training_audit import audit_training
@@ -103,6 +103,10 @@ def main():
     cmd.add_argument('--right', action='append', required=True)
     cmd.add_argument('--preparation-dir', required=True)
     cmd.add_argument('--output', required=True)
+    cmd = sub.add_parser('repair-curve', help='compare single and complete repairs on the same group')
+    cmd.add_argument('--probe', required=True)
+    cmd.add_argument('--preparation-dir', required=True)
+    cmd.add_argument('--output', required=True)
     args = parser.parse_args()
     if args.command == 'train':
         result = train(args.stage, args.preparation_dir, args.model_dir, args.output_dir,
@@ -139,6 +143,8 @@ def main():
         result = select_cohort(args.probe, args.preparation_dir, args.output)
     elif args.command == 'compare-repairs':
         result = compare_repair_evaluations(args.left, args.right, args.preparation_dir, args.output)
+    elif args.command == 'repair-curve':
+        result = repair_curve(args.probe, args.preparation_dir, args.output)
     else:
         result = analyze({s: getattr(args,s.lower()) for s in ('E0','E1','E2','E3') if getattr(args,s.lower())},
                          args.output_dir, args.plot, args.preparation_dir,

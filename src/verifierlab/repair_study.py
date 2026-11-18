@@ -1,10 +1,12 @@
 """Select E5 training prompts from frozen E1 probes and compare held-out behavior."""
 import json
 from collections import Counter
+from itertools import combinations
+from math import dist, sqrt
 from pathlib import Path
 from statistics import mean
 
-from .analysis import diagnose_scored_row
+from .analysis import diagnose_scored_row, group_reward_evidence
 from .attribution import paired_prompt_interval
 from .experiment import prepared_inputs, read_json, write_json
 from .repair_replay import groups_from_run
@@ -39,6 +41,51 @@ def select_cohort(probes, preparation_dir, output):
     result = {'train_ids': selected, 'counts': counts, 'manifest': preparation['split_manifest_sha256']}
     write_json(output, result)
     return result
+
+
+def repair_curve(probe_dir, preparation_dir, output):
+    """Enumerate each possible budget of wrong-award removals on unchanged E1 groups."""
+    path = Path(probe_dir)
+    report = read_json(path / 'run.json')
+    splits, _, prep = prepared_inputs(preparation_dir, 'full')
+    if (report['stage'] != 'repair_probe' or report['mode'] != 'run' or report['status'] != 'passed'
+            or report['manifest_sha256'] != prep['split_manifest_sha256']):
+        raise ValueError('need a complete E1 training probe')
+    panel = report['settings']['repair_panel']
+    gold = {q['sample_id']: q['ground_truth'] for q in splits['grpo']}
+    expected = [(q, d) for d in range(panel['draws']) for q in panel['sample_ids']]
+    curves = []
+    for (_, rows), (question, draw) in zip(groups_from_run(path, report), expected, strict=True):
+        if any(r['source_sample_id'] != question or r['panel_draw'] != draw for r in rows):
+            raise ValueError('group differs from the frozen draw schedule')
+        rows = [diagnose_scored_row(r, gold[question]) for r in rows]
+        labels = [r['explicit_final_correct'] for r in rows]
+        candidates = [i for i, r in enumerate(rows) if r['weak_positive'] and labels[i] is False
+                      and not r['strict_correct']]
+        if None in labels or not candidates:
+            continue
+        for r, correct in zip(rows, labels, strict=True):
+            r['target_accuracy_reward'] = float(correct)
+        _, oracle = group_reward_evidence(rows, 'target', [0.2, 1.0])
+        target = [r['advantage'] for r in oracle]
+        budgets = []
+        for budget in range(len(candidates)+1):
+            absolute, rms = [], []
+            for removed in combinations(candidates, budget):
+                patched = [dict(r, repair_accuracy_reward=0. if i in removed else r['weak_accuracy_reward'])
+                           for i, r in enumerate(rows)]
+                _, evidence = group_reward_evidence(patched, 'repair', [0.2, 1.0])
+                actual = [r['advantage'] for r in evidence]
+                absolute.append(mean(abs(v-t) for v,t in zip(actual,target,strict=True)))
+                rms.append(dist(actual,target) / sqrt(len(target)))
+            budgets.append({'removed': budget, 'subsets': len(absolute), 'mean_absolute_error': mean(absolute),
+                            'mean_rms_error': mean(rms)})
+        curves.append({'source_sample_id': question, 'draw': draw, 'correct_finals': sum(labels),
+                       'weak_awards': sum(r['weak_positive'] for r in rows), 'eligible': len(candidates),
+                       'equal_format': len({r['format_reward'] for r in rows}) == 1, 'budgets': budgets})
+    result = {'groups_screened': len(expected), 'eligible_groups': len(curves), 'curves': curves}
+    write_json(output, result)
+    return {'groups_screened': len(expected), 'eligible_groups': len(curves)}
 
 
 def compare_repair_evaluations(left_paths, right_paths, preparation_dir, output):
