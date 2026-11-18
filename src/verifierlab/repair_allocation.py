@@ -20,9 +20,9 @@ def advantage(rows, rule):
 
 def group_curve(rows, flags, gram):
     target = advantage(rows, 'target')
-    curve = []
+    curve, residual_means = [], []
     for budget in range(len(flags) + 1):
-        metrics = defaultdict(list)
+        metrics, residuals = defaultdict(list), []
         for chosen in combinations(flags, budget):
             patched = [dict(r, selected_accuracy_reward=0. if i in chosen else r['weak_accuracy_reward'])
                        for i, r in enumerate(rows)]
@@ -30,12 +30,33 @@ def group_curve(rows, flags, gram):
             metrics['reward_mae'].append(mean(abs(r['selected_accuracy_reward'] - r['target_accuracy_reward'])
                                               for r in patched))
             metrics['advantage_mae'].append(mean(map(abs, error)))
-            metrics['advantage_rms'].append(sqrt(mean(d*d for d in error)))
+            residuals.append(error)
+            metrics['advantage_mse'].append(mean(d*d for d in error))
+            metrics['advantage_rms'].append(sqrt(metrics['advantage_mse'][-1]))
             if gram is not None:
-                squared = sum(di*dj*gram[i][j] for i, di in enumerate(error) for j, dj in enumerate(error))
-                metrics['gradient_norm'].append(sqrt(max(0., squared)) / len(rows))
+                metrics['gradient_mse'].append(gradient_squared_norm(error, gram))
+                metrics['gradient_norm'].append(sqrt(metrics['gradient_mse'][-1]))
         curve.append({name: mean(values) for name, values in metrics.items()})
-    return curve
+        residual_means.append(list(map(mean, zip(*residuals, strict=True))))
+    return curve, residual_means, gram
+
+
+def gradient_squared_norm(error, gram):
+    squared = sum(di*dj*gram[i][j] for i, di in enumerate(error) for j, dj in enumerate(error))
+    return max(0., squared) / len(error)**2
+
+
+def expected_metrics(profile, probabilities):
+    curve, residual_means, gram = profile
+    estimates = {k: sum(p*v[k] for p, v in zip(probabilities, curve, strict=True)) for k in curve[0]}
+    expected_residual = [sum(p*x for p,x in zip(probabilities, column, strict=True))
+                         for column in zip(*residual_means, strict=True)]
+    estimates['advantage_squared_bias'] = mean(x*x for x in expected_residual)
+    estimates['advantage_variance'] = max(0., estimates['advantage_mse'] - estimates['advantage_squared_bias'])
+    if gram is not None:
+        estimates['gradient_squared_bias'] = gradient_squared_norm(expected_residual, gram)
+        estimates['gradient_variance'] = max(0., estimates['gradient_mse'] - estimates['gradient_squared_bias'])
+    return estimates
 
 
 def load_gradients(directory, source):
@@ -137,12 +158,11 @@ def allocation(probe_dir, preparation_dir, output, gradient_dir=None):
             raise ValueError('invalid fixed-budget distribution')
         stratum.update(withdrawals=budget, probability_per_flag=probability)
         outcomes = defaultdict(lambda: defaultdict(list))
-        for _, _, curve in known:
-            for metric in curve[0]:
-                values = [v[metric] for v in curve]
-                options = {'original':values[0], 'individual':sum(p*v for p,v in zip(probs, values, strict=True)),
-                           'whole_groups':(1-probability)*values[0] + probability*values[-1]}
-                for policy, value in options.items():
+        distributions = {'original':[1.] + [0.]*size, 'individual':probs,
+                         'whole_groups':[1-probability] + [0.]*(size-1) + [probability]}
+        for _, _, profile in known:
+            for policy, probabilities in distributions.items():
+                for metric, value in expected_metrics(profile, probabilities).items():
                     outcomes[metric][policy].append(value)
                     aggregate[metric][policy].append(value)
         stratum['expected_error_per_labeled_group'] = {
