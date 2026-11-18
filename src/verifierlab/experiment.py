@@ -210,7 +210,8 @@ class Session:
                     or proof['run_report_sha256'] != file_identity(smoke_path / 'run.json')['sha256']
                     or smoke['mode'] != 'smoke' or smoke['status'] != 'passed'
                     or smoke['signature'] != self.report['signature']
-                    or not (smoke.get('trainer_validated') or smoke.get('model_generation_validated'))):
+                    or not (smoke.get('trainer_validated') or smoke.get('model_generation_validated')
+                            or smoke.get('gradient_validated'))):
                 raise ValueError('stale/mismatched smoke admission')
             self.report['admission_sha256'] = file_identity(approval)['sha256']
             self.report['pilot_full_admitted'] = True
@@ -258,7 +259,8 @@ def approve(run_dir, output, review_note):
     report = read_json(Path(run_dir) / 'run.json')
     validate_smoke(run_dir, report)
     if (report['status'] != 'passed' or report['mode'] != 'smoke' or not review_note.strip()
-            or not (report.get('trainer_validated') or report.get('model_generation_validated'))):
+            or not (report.get('trainer_validated') or report.get('model_generation_validated')
+                    or report.get('gradient_validated'))):
         raise ValueError('only a complete real smoke can be reviewed for admission')
     result = {'approved': True, 'review_note': review_note, 'run_dir': str(Path(run_dir).resolve()),
               'run_report_sha256': file_identity(Path(run_dir) / 'run.json')['sha256']}
@@ -299,6 +301,11 @@ def validate_smoke(directory, report):
             raise ValueError('gradient signal counts inconsistent with recorded events')
         if stage in ('E2','E3','E4','E5') and not {'reference-logits.pt','reward-rollouts.jsonl','reward-groups.jsonl'} <= set(report['artifacts']):
             raise ValueError('GRPO reference/group evidence missing')
+    elif stage == 'repair_gradient':
+        if (not report.get('gradient_validated') or report.get('groups') != 2
+                or not 0 <= report['direct_gradient_relative_error'] < 0.025
+                or len((directory/'group-gradients.jsonl').read_text().splitlines()) != 2):
+            raise ValueError('real LoRA gradient smoke evidence missing')
     elif stage in ('E0_eval','E1_eval','E2_eval','E3_eval','E4_eval','E5_eval','weak_audit','repair_probe'):
         if not {'raw.jsonl','scored.jsonl','metrics.json'} <= set(report['artifacts']) or not report['model_generation_validated']:
             raise ValueError('model generation evidence missing')
