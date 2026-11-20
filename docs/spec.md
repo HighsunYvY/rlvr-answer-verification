@@ -2,7 +2,7 @@
 
 ## 输入、配置和训练契约
 
-- [sources.json](../configs/sources.json) 固定 Qwen2.5-0.5B-Instruct 模型与 tokenizer revision、GSM8K main revision 和文件清单。输入准备验证上游对象及本地字节身份。实验使用经过验证的本地快照和分片。
+- [sources.json](../configs/sources.json) 和 [sources-1.5b.json](../configs/sources-1.5b.json) 分别固定 Qwen2.5-0.5B-Instruct 和 Qwen2.5-1.5B-Instruct 的模型与 tokenizer revision、GSM8K main revision 和文件清单。输入准备验证上游对象及本地字节身份。实验使用经过验证的本地快照和分片。
 - `sample_id` 采用 `train:索引` 或 `test:索引`。GSM8K 原始答案使用单个 `####` 分隔示范推导和数值 gold。数据集保存各字段，模型生成只接收提示词，SFT 使用示范，GRPO 奖励和评测通过冻结记录取 gold。
 - [data.yaml](../configs/data.yaml)、[sft.yaml](../configs/sft.yaml)、[grpo_strict.yaml](../configs/grpo_strict.yaml)、[grpo_weak.yaml](../configs/grpo_weak.yaml) 和 [evaluation.yaml](../configs/evaluation.yaml) 使用 JSON 语法。实际参数以锁定的配置和运行记录为准。默认 LoRA 为 `q_proj/v_proj`、秩 16、alpha 32、dropout 0。SFT 峰值学习率为 `2e-4`。GRPO 峰值学习率为 `5e-6`，使用组内缩放、`G=4`、KL 系数 0.04、temperature 0.8、top-p 0.95 和 256 token 的提示词上限。
 - 当前训练契约为单进程 BF16 CUDA。微批大小为 1，梯度累积为 8；默认 GRPO 生成批含 8 个回答，对应两个各含 4 个回答的提示词组。
@@ -26,12 +26,14 @@ strict 与 weak 都将合法数值通过 `Decimal` 转为 `Fraction`，按精确
 
 奖励为 `0.2 × format + correctness`，两个分项各取 0 或 1。格式合规与正确性分别贡献奖励。批次错位触发失败，输入准备拒绝无效 gold。回归用例集中在 [test_verifierlab.py](../tests/test_verifierlab.py)。
 
+E4 按提示词和格式分值，对 strict 失败回答的宽松正确性奖励做置换。E5 的 `all_wrong` 和 `mixed` 只干预训练分片，要求四个回答完整、格式合规、终答诊断与 strict 判定一致，且至少有一个 weak 通过、strict 失败的候选。策略按组型、每题一次的限制和窗口剩余预算选择是否撤奖，由种子确定候选选择。 `tag_priority` 使用可解析标签的 strict 奖励，对其余回答使用 weak 奖励。细节见[研究设计](design.md#e5-的撤奖配对)。
+
 ## 证据与变更
 
 评测记录样本 ID、生成文本、gold、解析答案、判定标志、奖励、错误类别、token 数和终止原因。生成 token 数包含 EOS，排除 EOS 后的 padding。EOS 与长度上限同时出现时以 EOS 为终止原因。缺少 EOS 且用完预算时标为截断。
 
 令 `S` 表示 strict 通过，`W` 表示 weak 通过，`FP` 表示 weak 通过且 strict 失败。strict 正确率、格式率和 weak 阳性率以全部样本为分母。weak 分歧报告三种比例，即 `FP/全部样本`、`FP/strict 失败样本` 和 `FP/weak 通过样本`。分母为零的指标记为 `null`。
 
-E3 准入在 E1 的完整开发集上采样。当前 [weak_audit.json](../configs/weak_audit.json) 要求至少 1 个 FP，至少 2 个 weak 总奖励有变化的组，且这类组占比至少为 0.1。审阅同时查看正确性奖励与总奖励的组内方差。达到阈值并完成证据审阅后，生成显式准入记录。变更验证器语义时更新规格版本并重新执行审计和配对实验。
+基于宽松奖励的 E3–E5 准入在 E1 的完整开发集上采样。当前 [weak_audit.json](../configs/weak_audit.json) 要求至少 1 个 FP，至少 2 个 weak 总奖励有变化的组，且这类组占比至少为 0.1。审阅同时查看正确性奖励与总奖励的组内方差。达到阈值并完成证据审阅后，生成显式准入记录。变更验证器语义时更新规格版本并重新执行审计和配对实验。
 
 本地开发与审阅使用 macOS，GPU 实验在 Ubuntu + CUDA 执行。模型与数据下载、环境变更、运行验证、提交和推送各自遵循项目授权范围。仓库保留代码、配置、文档和小型结果摘要；模型、数据、缓存、凭据、原始运行和个人指导材料保存在本地或持久存储。每次实验使用已提交版本和独立输出目录，保留失败及中间产物。协作要求见 [AGENTS.md](../AGENTS.md) 和 [CONTRIBUTING.md](../CONTRIBUTING.md)。

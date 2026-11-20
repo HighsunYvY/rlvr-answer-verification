@@ -1,0 +1,25 @@
+{
+  "description": "Post-hoc decisions for parser-undetermined answers in the original random panel. Used only by the offline reward comparison.",
+  "source_commit": "e0dd4902be422d0b7be9901bb2fea5c19f7d51a5",
+  "source_scored_artifact": "964f148aa2af9a3ef38ec9bd33f92757acccdd15d7ba7f731b2ea4ef175bbbdb",
+  "decisions": {
+    "train:2196#g0#d3": "correct",
+    "train:3538#g2#d0": "wrong",
+    "train:3564#g2#d1": "correct",
+    "train:3616#g2#d3": "correct",
+    "train:5032#g1#d1": "wrong",
+    "train:5709#g3#d0": "correct",
+    "train:5905#g1#d1": "wrong",
+    "train:5955#g3#d2": "wrong",
+    "train:602#g2#d1": "wrong",
+    "train:6189#g2#d3": "wrong",
+    "train:6189#g3#d3": "wrong",
+    "train:6418#g0#d2": "wrong",
+    "train:6919#g2#d1": "wrong",
+    "train:6995#g3#d2": "wrong",
+    "train:7296#g2#d0": "wrong",
+    "train:7296#g3#d1": "wrong",
+    "train:735#g0#d1": "unresolved",
+    "train:947#g2#d0": "unresolved"
+  }
+}

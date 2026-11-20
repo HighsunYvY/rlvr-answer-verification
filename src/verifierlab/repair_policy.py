@@ -6,6 +6,12 @@ from .evaluate import diagnose_final_answer
 from .verifier import normalize_number
 
 
+def tag_priority_accuracy_reward(row):
+    if normalize_number(row['parsed_answer']) is not None:
+        return row['strict_accuracy_reward']
+    return row['weak_accuracy_reward']
+
+
 class RepairPolicy:
     def __init__(self, plan, steps, seed):
         self.policy = plan['policy']
@@ -34,9 +40,7 @@ class RepairPolicy:
         source = members[0]['source_sample_id']
         if partition == 'train':
             if self.policy == 'tag_priority':
-                for i, row in enumerate(members):
-                    if normalize_number(row['parsed_answer']) is not None:
-                        scores[i] = row['strict_accuracy_reward']
+                scores = [tag_priority_accuracy_reward(row) for row in members]
             elif self.policy == context and eligible and source not in self.used_ids:
                 window = step // self.window
                 if self.spent[window] < self.caps[window]:

@@ -8,7 +8,7 @@ from pathlib import Path
 from statistics import mean
 
 from .analysis import diagnose_scored_row, group_reward_evidence
-from .experiment import prepared_inputs, read_json, write_json
+from .experiment import file_identity, prepared_inputs, read_json, verify_inventory, write_json
 from .repair_replay import groups_from_run
 from .verifier import normalize_number
 
@@ -59,16 +59,19 @@ def expected_metrics(profile, probabilities):
     return estimates
 
 
-def load_gradients(directory, source):
+def load_gradients(directory, source, source_report):
     if directory is None:
         return {}
     path = Path(directory)
     report = read_json(path/'run.json')
     if (report['status'] != 'passed' or report['mode'] != 'run' or report['stage'] != 'repair_gradient'
             or not report['gradient_validated'] or report['policy_identity'] != source['policy_identity']
-            or report['manifest_sha256'] != source['manifest_sha256']):
-        raise ValueError('incompatible full gradient probe')
-    with (path/'group-gradients.jsonl').open() as stream:
+            or report['manifest_sha256'] != source['manifest_sha256']
+            or report['settings']['source_report'] != file_identity(source_report)['sha256']):
+        raise ValueError('gradient probe must use this exact frozen answer bank')
+    filename = 'group-gradients.jsonl'
+    verify_inventory(path, {filename: report['artifacts'][filename]})
+    with (path / filename).open() as stream:
         records = {(r['sample_id'], r['draw']): r for r in map(json.loads, stream)}
     if len(records) != report['groups']:
         raise ValueError('gradient probe group count mismatch')
@@ -102,14 +105,16 @@ def sampled_groups(path, source, splits):
 
 def allocation(probe_dir, preparation_dir, output, gradient_dir=None):
     path = Path(probe_dir)
-    source = read_json(path/'run.json')
+    source_report = path / 'run.json'
+    source = read_json(source_report)
     splits, _, prep = prepared_inputs(preparation_dir, 'full')
     if (source['status'] != 'passed' or source['mode'] != 'run'
             or source['settings']['generation']['num_return_sequences'] != 4
             or source['manifest_sha256'] != prep['split_manifest_sha256']):
         raise ValueError('need complete four-answer sampling on the frozen preparation')
+    verify_inventory(path, {'scored.jsonl': source['artifacts']['scored.jsonl']})
     labels = {r['sample_id']: r['ground_truth'] for r in splits[source['settings']['split']]}
-    gram_rows = load_gradients(gradient_dir, source)
+    gram_rows = load_gradients(gradient_dir, source, source_report)
     strata = defaultdict(list)
     sampled = 0
     for key, draw, group in sampled_groups(path, source, splits):

@@ -1,0 +1,31 @@
+{
+  "sample_ids": [
+    "train:1034",
+    "train:1062",
+    "train:1174",
+    "train:1608",
+    "train:2194",
+    "train:2613",
+    "train:2731",
+    "train:3382",
+    "train:3439",
+    "train:3544",
+    "train:372",
+    "train:3873",
+    "train:4143",
+    "train:4238",
+    "train:4671",
+    "train:5162",
+    "train:5379",
+    "train:5415",
+    "train:5511",
+    "train:58",
+    "train:6424",
+    "train:6531",
+    "train:788",
+    "train:840"
+  ],
+  "seed": 45,
+  "draws": 8,
+  "selection": "Every non-excluded GRPO training question with a weak-only incorrect final in a fully classified group in the prior E2, E3 or E4 traces. No development or test questions."
+}

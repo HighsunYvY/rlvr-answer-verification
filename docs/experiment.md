@@ -15,8 +15,8 @@ from pathlib import Path
 for directory in ("src", "tests"):
     for path in Path(directory).rglob("*.py"):
         ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-for path in Path("configs").iterdir():
-    if path.suffix in {".yaml", ".json"}:
+for path in Path("configs").rglob("*"):
+    if path.is_file() and path.suffix in {".yaml", ".json"}:
         json.loads(path.read_text(encoding="utf-8"))
 PY
 git diff --check
@@ -79,13 +79,14 @@ uv pip check --python "$PY"
 
 `--profile` 选择冻结数据和预算。每个目标 profile 的 `--mode smoke` 使用同一份准备产物和序列上限，取八条训练样本和四条开发集或测试集样本进行检查，训练执行两步。`--mode run` 使用完整分片和声明预算。pilot 和 full 的正式运行需要各阶段匹配的真实 smoke 和人工审阅。
 
-设置 `HF_HOME` 指向目标机的持久缓存。先用 `"$PY" -m verifierlab.snapshots --plan` 查阅固定文件清单与大小。以下示例从已有缓存恢复 full 输入。缓存缺失时，在获准的下载范围内另选输出目录，执行同一准备命令并加上 `--download`，下载时启用 Hub 网络访问，下载完成后恢复离线执行。
+设置 `HF_HOME` 指向目标机的持久缓存。用 `"$PY" -m verifierlab.snapshots --sources configs/sources-1.5b.json --plan` 查阅固定文件清单与大小。以下示例从已有缓存准备 1.5B 的 full 输入。缓存缺失时，在获准的下载范围内另选输出目录，执行同一准备命令并加上 `--download`，下载时启用 Hub 网络访问，下载完成后恢复离线执行。准备 0.5B 输入时使用 `configs/sources.json`。
 
 ```bash
 PROFILE=full
 PREP="$RUN_ROOT/preparation"
 HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
-  "$PY" -m verifierlab.snapshots --profile "$PROFILE" --output-dir "$PREP"
+  "$PY" -m verifierlab.snapshots --sources configs/sources-1.5b.json \
+  --profile "$PROFILE" --output-dir "$PREP"
 MODEL="$("$PY" -c 'import json,sys; r=json.load(open(sys.argv[1])); assert r["status"]=="passed"; print(r["snapshots"]["model"]["path"])' "$PREP/preparation.json")"
 export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 ```
@@ -141,9 +142,40 @@ stage_pair() {
 
 环境探针、API 和合成测试各自覆盖前置条件。pilot/full 的准入证据来自目标阶段的真实模型运行。准确率用于结果分析，生成 smoke 以完整且一致的运行证据为通过条件。
 
-## E0–E3 顺序
+## 复现当前实验
 
-先完成 E0 评测和 E1，再从同一 E1 开始 E2 与 E3。E3 先完成整个开发集的 E1 审计，并由审阅者核对 weak 分歧样本和组内奖励后生成单独准入。
+从仓库根目录预览某一阶段的命令。将 `--work-dir` 指向用于本轮产物的已有父目录，`--preparation-dir` 和 `--model-dir` 分别指向完整准备目录和本地模型快照。下面以同一个运行目录承载基线和后续实验为例。
+
+```bash
+"$PY" -m verifierlab.reproduce preview online --python "$PY" \
+  --work-dir "$RUN_ROOT" --preparation-dir "$PREP" --model-dir "$MODEL"
+```
+
+替换 `online` 可以查看其他阶段。基线产物位于单独目录时，通过 `--baseline-dir` 指定基线产物的父目录。默认从该目录读取 `e1-train/` 和 `weak-admission.json`。历史 E1 目录名称不同时可用 `--sft-run` 指向实际路径。`gradient` 和 `offline` 默认读取 `--work-dir` 下的 `random-panel/`，也可通过 `--probe-dir` 使用归档中实际的采样目录。
+
+| 阶段 | 输入与产物 |
+| --- | --- |
+| `baselines` | 准备审计过的 1.5B 分片，训练 E1–E4，生成冻结测试输出并审计 E4 奖励重分配。已有对应分片时直接使用。 |
+| `probes` | 从同一个 E1 按两批冻结题目生成固定回答，按项目的筛选条件输出 `cohort.json`，与 [E5 配置](../configs/gsm8k-1.5b-reward-repair/repair.json) 中的 35 个训练 ID 对照。 |
+| `online` | 使用冻结的 35 个 ID。每个种子先训练并审计全错策略，再根据实际撤奖数生成有对有错策略的计划。完成四个条件后生成冻结测试输出，统计两种配对差。 |
+| `gradient` | 使用 `probes` 产出的随机采样回答和原 E1，计算固定回答的局部 LoRA 梯度。 |
+| `offline` | 读取已完成的采样、梯度和冻结测试输出，统计错奖、梯度偏差以及整组和逐笔纠错的差异。 |
+| `legacy` | 查看历史 0.5B 多种子流程。按打印的历史版本和对应准备产物运行，再回到当前版本汇总。重算原报告时，用已有的种子 42 训练和评测审计路径替换命令中的对应路径。 |
+
+`preview` 只打印命令。执行时逐阶段核对真实 smoke，再填写生成的 `--review-note ''`；基于宽松规则的训练也需要审阅完整开发集的 E1 审计。E5 的对照表以审计中的实际 `withdrawn_awards` 验证预算匹配。任一窗口未达到配额时如实记录。
+
+新生成的回答由自动判定汇总。重算原报告中复核后的错奖数时，将 `ARCHIVED_PROBE` 设为存有原始 `scored.jsonl` 和 `run.json` 的目录，并使用[归档人工判定](../configs/gsm8k-1.5b-reward-repair/archived-final-review.json)。在整组纠错的梯度回放中，梯度记录也必须来自同一份固定回答。
+
+```bash
+"$PY" -m verifierlab.study_analysis panel-rewards \
+  --probe-dir "$ARCHIVED_PROBE" --preparation-dir "$PREP" \
+  --review-file configs/gsm8k-1.5b-reward-repair/archived-final-review.json \
+  --output "$RUN_ROOT/archived-panel-reward-counts.json"
+```
+
+## 历史 E0–E3 顺序
+
+这一流程展示早期 0.5B 贪心评测的顺序。逐值复现历史表格时使用当时的代码和准备产物。先完成 E0 评测和 E1，再从同一 E1 开始 E2 与 E3。E3 先完成整个开发集的 E1 审计，并由审阅者核对 weak 分歧样本和组内奖励后生成单独准入。
 
 ```bash
 stage_pair e0-eval evaluate --split test
